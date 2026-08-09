@@ -1,4 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "phi2-eo-tile-filter"
-version = "0.1.0"
-requires-python = ">=3.9"
+version = "0.2.0"
+description = "Deterministic EO tile triage demonstrator with ONNX INT8 deployment and assurance checks."
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.9,<3",
+  "numpy>=1.26,<3",
+  "onnx>=1.19,<2",
+  "onnxscript>=0.7,<1",
+  "onnxruntime>=1.20,<2",
+  "Pillow>=10.2,<13",
+  "scikit-learn>=1.5,<2",
+  "psutil>=5.9,<8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]

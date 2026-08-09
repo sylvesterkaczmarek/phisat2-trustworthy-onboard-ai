@@ -1,21 +1,30 @@
-name: ci
-on: { push: {}, pull_request: {} }
+name: CI
+
+on:
+  push:
+  pull_request:
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      PYTHONHASHSEED: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
-      - run: |
-          python -m pip install --upgrade pip
-          pip install -r examples/phi2-eo-tile-filter/requirements.txt
-          pip install onnxscript==0.1.0
-      - name: Smoke test EO example
-        working-directory: examples/phi2-eo-tile-filter
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: examples/phi2-eo-tile-filter/requirements.txt
+      - name: Install dependencies
         run: |
-          python -m data.synth --out ./tiles --n 64 --bands 3 --size 32
-          python -m src.train --data ./tiles --epochs 1 --bands 3 --size 32
-          python -m src.export_onnx --weights runs/tinycnn.pt --out models/tinycnn_fp32.onnx --bands 3 --size 32
-          python -m src.quantize_ptq --onnx models/tinycnn_fp32.onnx --calib ./tiles/val --out models/tinycnn_int8.onnx --size 32
-          python -m src.infer_onnx --onnx models/tinycnn_int8.onnx --data ./tiles/val --bands 3 --size 32
+          python -m pip install --upgrade pip
+          python -m pip install -e "examples/phi2-eo-tile-filter[dev]"
+      - name: Compile
+        run: python -m compileall -q assurance examples/phi2-eo-tile-filter
+      - name: Test
+        working-directory: examples/phi2-eo-tile-filter
+        run: python -m pytest -q
+      - name: Smoke demo
+        working-directory: examples/phi2-eo-tile-filter
+        run: python scripts/run_demo.py --n 96 --size 32 --bands 7 --epochs 1 --seed 0 --output-root /tmp/phi2-demo

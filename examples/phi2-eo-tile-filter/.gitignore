@@ -1,7 +1,0 @@
-.venv/
-__pycache__/
-tiles/
-logs/
-reports/
-runs/
-*.pt

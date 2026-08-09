@@ -1,147 +1,178 @@
 # PhiSat-2 Trustworthy Onboard AI
-[![CI](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/actions/workflows/ci.yml)
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17567181.svg)](https://doi.org/10.5281/zenodo.17567181)
-[![Discussions](https://img.shields.io/github/discussions/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai)](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/discussions)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 ![PhiSat-2 Trustworthy Onboard AI](assets/social/github-social-card-phisat2-onboard-ai.png)
 
-Compact PyTorch → ONNX → INT8 pipeline for onboard inference on EO small-sat/CubeSat platforms. Includes an Earth Observation tile triage example that mirrors a PhiSat-2 style onboard selection step. Runs locally on a laptop or a small SBC. See the runnable demo in `examples/phi2-eo-tile-filter`.
+[![CI](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17567181.svg)](https://doi.org/10.5281/zenodo.17567181)
 
-## Project overview
+Research demonstrator for deterministic Earth-observation tile triage, PyTorch to ONNX deployment, static INT8 quantization, conservative downlink fallback, telemetry, and model rollback. The workflow is inspired by onboard EO processing such as PhiSat-2, but it is independent software and is not ESA or PhiSat-2 flight code.
 
-- Train a tiny CNN on small tiles.
-- Export FP32 ONNX and quantize to static INT8 (QDQ) with ONNX Runtime.
-- Benchmark latency and memory on the ORT CPU Execution Provider.
-- Calibrate a confidence threshold to hit a target recall.
-- Filter tiles for event-triggered downlink to save bandwidth.
-- Ship assurance hooks: watchdog, telemetry log, rollback, and a run summary.
+## At a glance
 
-## Why this is useful
-- End-to-end path from training to a compact INT8 artifact suitable for onboard execution (PyTorch → ONNX → ORT INT8).
-- Calibrated confidence gate to meet a target recall, letting you trade downlink volume against science yield.
-- Assurance hooks: watchdog, fallback-to-downlink on low confidence, rollback to last-known-good, and JSONL telemetry (latency + hashes) for audit.
-- Deterministic, CI-checked demo with fixed seeds and small scripts; easy to port to HIL or ARM/aarch64 ORT.
-- Produces measurable stats (accuracy, confusion, latency, bandwidth saved) to support requirement verification.
+```mermaid
+flowchart LR
+    A[Train split] --> B[TinyCNN]
+    B --> C[FP32 ONNX]
+    C --> D[INT8 QDQ]
+    E[Calibration split] --> F[Event threshold and temperature]
+    D --> F
+    D --> G[Held-out model validation]
+    F --> H[Downlink policy]
+    I[Test split] --> G
+    I --> H
+    H --> J[Telemetry and report]
+```
 
-## Features
+The design separates model training, policy calibration, and final evaluation. A calibration policy is cryptographically bound to the model SHA-256 and cannot silently be reused with a different model.
 
-- Minimal dependencies (PyTorch, ONNX, ONNX Runtime; a few small extras).
-- Clear scripts: `train`, `export_onnx`, `quantize_ptq`, `infer_onnx`, `bench_onnxruntime`, `bandwidth_filter`.
-- Self-contained synthetic dataset for quick runs; swap to Sentinel-2 crops and recalibrate.
-- CI workflow that smoke-tests the pipeline on push and PR.
-- Seeded runs and JSONL logs for reproducibility and audit.
-- Laptop or small SBC ready (ORT CPU EP) with a path to ARM/aarch64.
-- Assurance utilities in `assurance/` (watchdog, telemetry, summarizer, rollback).
+## What is implemented
 
-## ESA PhiSat-2 context
+- deterministic synthetic EO data generation with independent `train`, `calib`, and `test` splits
+- arbitrary multispectral band counts through NumPy tile stacks
+- deterministic TinyCNN training with architecture metadata stored in the checkpoint
+- PyTorch to FP32 ONNX export with ONNX validation and numerical equivalence check
+- static QDQ INT8 quantization with calibration data kept separate from final test data
+- held-out FP32 versus INT8 accuracy and prediction-agreement regression checks
+- calibrated event threshold targeting a requested event recall
+- optional deterministic temperature scaling on the calibration split
+- conservative fallback that downlinks low-confidence tiles and inference failures
+- model/policy hash binding
+- per-tile input and model SHA-256 telemetry
+- exact byte-level bandwidth accounting
+- atomic known-good model promotion and rollback
+- bounded watchdog without `shell=True`
+- CI that runs the full multispectral pipeline
 
-This repository reflects workflows used in missions with onboard processing, such as ESA’s PhiSat-2 CubeSat for AI-enabled EO. The example filters tiles onboard and prioritizes downlink of useful data. Mission page: https://earth.esa.int/eogateway/missions/phisat-2
+## Decision policy
+
+A tile is retained when it is predicted to contain the target event, when confidence is below the configured minimum, or when preprocessing/inference fails. Only confidently classified background data are discarded.
+
+This is intentionally conservative about science-data loss. See [docs/assurance.md](docs/assurance.md).
 
 ## Quick start
 
 ```bash
-cd examples/phi2-eo-tile-filter
-python -m venv .venv && source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt onnxscript==0.1.0 scikit-learn
-
-# data → train → export → quantize → eval
-python -m data.synth --out ./tiles --n 200 --bands 3 --size 64
-python -m src.train --data ./tiles --epochs 12 --base 32 --lr 0.003
-python -m src.export_onnx --weights runs/tinycnn.pt --out models/tinycnn_fp32.onnx --bands 3 --size 64 --base 32
-python -m src.quantize_ptq --onnx models/tinycnn_fp32.onnx --calib ./tiles/val --out models/tinycnn_int8.onnx --size 64 --bands 3
-python -m src.infer_onnx --onnx models/tinycnn_int8.onnx --data ./tiles/val --size 64 --bands 3
-
-# calibrate → filter → telemetry → report
-python -m src.calibrate_threshold --onnx models/tinycnn_int8.onnx --data ./tiles/val --target_recall 0.95 --out calibration.json
-mkdir -p logs
-python -m src.bandwidth_filter --onnx models/tinycnn_int8.onnx --data ./tiles/val --calibration calibration.json --downlink_out downlink --log logs/downlink.jsonl
-THR=$(python -c "import json; print(json.load(open('calibration.json'))['threshold'])")
-python ../../assurance/telemetry_log.py --onnx models/tinycnn_int8.onnx --data ./tiles/val --out logs/val.jsonl --threshold "$THR"
-python ../../assurance/summarize.py --val_log logs/val.jsonl --downlink_log logs/downlink.jsonl --val_dir tiles/val --calib calibration.json --out_dir reports
-cat reports/summary.md
+git clone https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai.git
+cd phisat2-trustworthy-onboard-ai/examples/phi2-eo-tile-filter
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python scripts/run_demo.py --n 200 --bands 3 --size 64 --epochs 3 --seed 0
 ```
 
-## Outputs
+A multispectral run uses the same pipeline:
 
-- `logs/downlink.jsonl` decisions used by the bandwidth filter
-- `logs/val.jsonl` per tile telemetry with probabilities and latency
-- `reports/summary.md` and `reports/metrics.json` summary for quick review
-- `models/tinycnn_fp32.onnx` and `models/tinycnn_int8.onnx` artifacts
+```bash
+python scripts/run_demo.py --n 160 --bands 7 --size 32 --epochs 2 --seed 0 --output-root /tmp/phi2-7band
+```
 
-## Results snapshot
+The synthetic generator uses `.npy` arrays so band counts greater than RGB are preserved without pretending that PNG is a multispectral format.
 
-Numbers from the latest synthetic run in `examples/phi2-eo-tile-filter`.
-| Metric | Value |
-|---|---|
-| Threshold | 0.678 |
-| Recall | 0.95 |
-| Precision | 1.00 |
-| AUC | 1.00 |
-| Avg latency (ms) | 0.459 |
-| Tiles kept | 19 / 40 |
-| Bandwidth saved | 54.9% |
+## Generated outputs
 
-## Assurance hooks
+A complete run produces:
 
-See `assurance/`.
-- `watchdog.py` restarts a failing inference command a few times
-- `telemetry_log.py` emits one JSON line per tile with hashes and timings
-- `summarize.py` converts logs into a small Markdown and JSON metrics report
-- `rollback.sh` swaps back to the last good FP32 model
+```text
+calibration.json
+logs/test.jsonl
+logs/downlink.jsonl
+models/active.onnx
+models/model_state.json
+reports/model_validation.json
+reports/metrics.json
+reports/summary.md
+```
 
-## File layout
+The report uses held-out test telemetry for precision, recall, AUC, latency, fallback count, event capture, and exact byte-level bandwidth savings. Calibration metrics are kept separate from test metrics.
+
+## Validation gates
+
+The pipeline fails rather than silently continuing when:
+
+- the checkpoint architecture metadata do not match the exporter
+- PyTorch and FP32 ONNX outputs exceed the configured numerical tolerance
+- ONNX structural validation fails
+- the quantized artifact lacks the expected QDQ operators
+- held-out INT8 accuracy degrades beyond the allowed threshold
+- FP32 and INT8 prediction agreement falls below the required level
+- a calibration file belongs to a different model hash or input shape
+
+## Known-good model handling
+
+After validation, the INT8 candidate can be promoted atomically:
+
+```bash
+python ../../assurance/model_store.py promote \
+  --candidate models/tinycnn_int8.onnx \
+  --active models/active.onnx \
+  --previous models/previous.onnx \
+  --manifest models/model_state.json
+```
+
+Rollback is location-independent:
+
+```bash
+bash ../../assurance/rollback.sh
+```
+
+## Watchdog
+
+The watchdog takes an explicit argv list and does not execute a shell command string:
+
+```bash
+python ../../assurance/watchdog.py --restarts 3 --sleep-s 2 --cwd . -- \
+  python -m phi2_tile_filter.infer_onnx --onnx models/active.onnx --data tiles/test
+```
+
+## Data interface
+
+The demonstration accepts image files for 1, 3, or 4 bands and `.npy` arrays for arbitrary multispectral input. Floating-point NumPy tiles must already be scaled to `[0, 1]`. Real mission data should have a documented preprocessing and radiometric normalization pipeline rather than relying on this toy loader.
+
+## Reproducibility
+
+See [docs/reproducibility.md](docs/reproducibility.md). Training seeds Python, NumPy, PyTorch, and DataLoader shuffling. CI performs the end-to-end pipeline using a seven-band synthetic dataset so multispectral support cannot regress unnoticed.
+
+## What this repository does not claim
+
+This repository is a software and assurance demonstrator. The synthetic benchmark is deliberately simple. It does not establish PhiSat-2 performance, flight readiness, radiation tolerance, worst-case execution time, hardware qualification, operational EO accuracy, formal safety, or mission-level fault tolerance.
+
+The watchdog and rollback helpers are process-level examples rather than flight-qualified FDIR. Real onboard deployment would also require representative sensor data, hardware-in-the-loop validation, resource and thermal limits, persistent storage guarantees, signed model/update handling, fault injection, and mission-specific acceptance criteria.
+
+## Repository layout
 
 ```text
 .
-├─ assurance/                   # watchdog, rollback, telemetry, summary
-├─ examples/
-│  └─ phi2-eo-tile-filter/
-│     ├─ data/                  # synthetic tiles
-│     ├─ src/                   # train, export, quantize, infer, bench, filter
-│     ├─ logs/ and reports/     # created by the quick start
-│     └─ models/                # TinyCNN
-└─ .github/workflows/ci.yml     # smoke test pipeline
+├── .github/workflows/ci.yml
+├── assurance/
+│   ├── model_store.py
+│   ├── rollback.sh
+│   ├── summarize.py
+│   ├── telemetry_log.py
+│   └── watchdog.py
+├── docs/
+│   ├── assurance.md
+│   └── reproducibility.md
+├── examples/phi2-eo-tile-filter/
+│   ├── data/
+│   ├── scripts/run_demo.py
+│   ├── src/phi2_tile_filter/
+│   └── tests/
+├── CITATION.cff
+├── LICENSE
+├── Makefile
+└── README.md
 ```
 
-## Extending
+## Cite this repository
 
-- Swap synthetic tiles for Sentinel-2 crops and recalibrate the gate for the same recall target.
-- Add OpenVINO or TensorRT export paths for specific hardware.
-- Log exact downlink bytes and confidence histograms for fuller telemetry.
-- Replace `TinyCNN` with a stronger model and keep the PyTorch → ONNX → INT8 interface stable.
-
-## Requirements
-
-- Python 3.12
-- torch ≥ 2.2, onnx 1.19.1, onnxruntime 1.23.2
-- numpy, Pillow, scikit-learn, psutil, pytest
-
-## Cite this demo
-
-If you use or adapt this repository, please cite
+If you use or adapt this repository, please cite:
 
 > Kaczmarek, S. (2025). *PhiSat-2 Trustworthy Onboard AI*. Zenodo. https://doi.org/10.5281/zenodo.17567181
-
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17567181.svg)](https://doi.org/10.5281/zenodo.17567181)
-
-**BibTeX**
-```bibtex
-@software{Kaczmarek_2025_PhiSat2_Onboard_AI,
-  author    = {Sylvester Kaczmarek},
-  title     = {{PhiSat-2 Trustworthy Onboard AI}},
-  year      = {2025},
-  publisher = {Zenodo},
-  url       = {https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai},
-  doi       = {10.5281/zenodo.17567181}
-}
-```
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
-© **Sylvester Kaczmarek** · https://www.sylvesterkaczmarek.com
+© **Sylvester Kaczmarek** · [https://www.sylvesterkaczmarek.com](https://www.sylvesterkaczmarek.com)
