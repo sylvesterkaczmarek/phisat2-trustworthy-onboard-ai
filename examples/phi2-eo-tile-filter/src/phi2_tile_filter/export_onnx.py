@@ -37,17 +37,20 @@ def export_model(weights: str | Path, output: str | Path, *, verify_atol: float 
     model.eval()
 
     torch.manual_seed(1234)
-    dummy = torch.randn(2, bands, size, size, dtype=torch.float32)
+    export_input = torch.randn(2, bands, size, size, dtype=torch.float32)
+    verify_input = torch.randn(3, bands, size, size, dtype=torch.float32)
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    batch_dim = torch.export.Dim("batch")
     torch.onnx.export(
         model,
-        (dummy[:1],),
+        (export_input,),
         str(destination),
         input_names=["input"],
         output_names=["logits"],
         opset_version=18,
         dynamo=True,
+        dynamic_shapes=({0: batch_dim},),
         external_data=False,
     )
 
@@ -61,16 +64,21 @@ def export_model(weights: str | Path, output: str | Path, *, verify_atol: float 
             "base": str(base),
             "num_classes": str(classes),
             "checkpoint_sha256": sha256_file(weights),
+            "batch_dimension": "dynamic",
         },
     )
     onnx.checker.check_model(onnx_model)
     onnx.save(onnx_model, str(destination))
 
     with torch.no_grad():
-        torch_logits = model(dummy).numpy()
+        torch_logits = model(verify_input).numpy()
     session = ort.InferenceSession(str(destination), providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
-    ort_logits = np.asarray(session.run(None, {input_name: dummy.numpy()})[0])
+    ort_logits = np.asarray(session.run(None, {input_name: verify_input.numpy()})[0])
+    if ort_logits.shape != torch_logits.shape:
+        raise RuntimeError(
+            f"PyTorch/ONNX output shape mismatch: {torch_logits.shape} versus {ort_logits.shape}"
+        )
     max_abs = float(np.max(np.abs(torch_logits - ort_logits)))
     argmax_agreement = float(np.mean(torch_logits.argmax(1) == ort_logits.argmax(1)))
     if max_abs > verify_atol or argmax_agreement != 1.0:
@@ -86,6 +94,8 @@ def export_model(weights: str | Path, output: str | Path, *, verify_atol: float 
         "bands": bands,
         "size": size,
         "base": base,
+        "batch_dimension": "dynamic",
+        "verification_batch_size": int(verify_input.shape[0]),
         "pytorch_onnx_max_abs_error": max_abs,
         "pytorch_onnx_argmax_agreement": argmax_agreement,
     }
