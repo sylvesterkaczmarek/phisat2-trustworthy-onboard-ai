@@ -1,29 +1,11 @@
 # Data
 
-Synthetic tiles used by the demo. Two classes: `background` and `event`.
+The demo generates deterministic synthetic tiles into independent `train`, `calib`, and `test` splits.
 
-## Generate
-```bash
-# from examples/phi2-eo-tile-filter
-python -m data.synth --out ./tiles --n 200 --bands 3 --size 64
-```
-- `--n` total tiles split 80% train / 20% val  
-- `--bands` input channels (use 3 here)  
-- `--size` square tile size in pixels
+- Training uses only `train`.
+- INT8 calibration and threshold/temperature selection use only `calib`.
+- Final model and downlink metrics use only `test`.
 
-## Output layout
-```
-tiles/
-├─ train/
-│  ├─ background/*.png
-│  └─ event/*.png
-└─ val/
-   ├─ background/*.png
-   └─ event/*.png
-```
-## Using your own EO tiles
-Place PNGs under the same folder structure as above. Any size works; scripts resize to the `--size` you pass. Keep at least ~50 images per class in `val` so INT8 calibration has enough samples.
+Synthetic tiles are stored as float32 `.npy` arrays in HWC layout and scaled to `[0, 1]`. This preserves arbitrary multispectral band counts without pretending that RGB image formats represent multispectral data.
 
-## Tips
-- Delete and re-generate tiles to refresh the dataset.
-- Keep real data out of git; the repo `.gitignore` excludes `tiles/`.
+Real EO data should use a documented, mission-specific preprocessing and radiometric-normalization path before being fed into this demonstrator.

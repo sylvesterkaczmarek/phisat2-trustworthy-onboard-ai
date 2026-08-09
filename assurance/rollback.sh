@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-set -e
-prev="models/tinycnn_fp32.onnx.bak"
-curr="models/tinycnn_fp32.onnx"
-if [ -f "$prev" ]; then
-  mv "$curr" "${curr}.bad.$(date +%s)" || true
-  mv "$prev" "$curr"
-  echo "Rolled back to previous FP32."
-else
-  echo "No backup found."
-fi
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EXAMPLE="$ROOT/examples/phi2-eo-tile-filter"
+python "$ROOT/assurance/model_store.py" rollback \
+  --active "$EXAMPLE/models/active.onnx" \
+  --previous "$EXAMPLE/models/previous.onnx" \
+  --manifest "$EXAMPLE/models/model_state.json"
