@@ -2,6 +2,7 @@ cff-version: 1.2.0
 title: PhiSat-2 Trustworthy Onboard AI
 message: "If you use this repository, please cite it."
 type: software
+version: 0.2.0
 authors:
   - family-names: Kaczmarek
     given-names: Sylvester
@@ -18,4 +19,7 @@ preferred-citation:
       given-names: Sylvester
       orcid: https://orcid.org/0000-0002-0393-228X
   year: 2025
+  publisher:
+    name: Zenodo
   doi: 10.5281/zenodo.17567181
+  url: https://doi.org/10.5281/zenodo.17567181
