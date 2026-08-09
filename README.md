@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17567181.svg)](https://doi.org/10.5281/zenodo.17567181)
 
@@ -158,18 +159,40 @@ The watchdog and rollback helpers are process-level examples rather than flight-
 │   ├── data/
 │   ├── scripts/run_demo.py
 │   ├── src/phi2_tile_filter/
-│   └── tests/
+│   ├── tests/
+│   ├── pyproject.toml
+│   └── requirements.txt
 ├── CITATION.cff
 ├── LICENSE
 ├── Makefile
 └── README.md
 ```
 
+## Requirements
+
+- Python 3.11 or newer
+- PyTorch 2.x
+- ONNX and ONNX Runtime for export, quantization, and inference
+- no accelerator is required for the CI-scale CPU demonstration
+
+Exact dependency bounds are defined in [`examples/phi2-eo-tile-filter/pyproject.toml`](examples/phi2-eo-tile-filter/pyproject.toml) and mirrored in [`requirements.txt`](examples/phi2-eo-tile-filter/requirements.txt).
+
 ## Cite this repository
 
 If you use or adapt this repository, please cite:
 
 > Kaczmarek, S. (2025). *PhiSat-2 Trustworthy Onboard AI*. Zenodo. https://doi.org/10.5281/zenodo.17567181
+
+```bibtex
+@software{Kaczmarek_2025_PhiSat2_Trustworthy_Onboard_AI,
+  author    = {Sylvester Kaczmarek},
+  title     = {{PhiSat-2 Trustworthy Onboard AI}},
+  year      = {2025},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.17567181},
+  url       = {https://doi.org/10.5281/zenodo.17567181}
+}
+```
 
 ## License
 
