@@ -25,6 +25,7 @@ robustness:
 	cd $(EXAMPLE) && $(PYTHON) scripts/run_robustness_benchmark.py
 
 clean:
+	@test "$(EXAMPLE)" = "examples/phi2-eo-tile-filter" || { echo "Refusing unsafe clean target: $(EXAMPLE)" >&2; exit 1; }
 	rm -rf $(EXAMPLE)/tiles $(EXAMPLE)/logs $(EXAMPLE)/reports $(EXAMPLE)/runs $(EXAMPLE)/downlink
 	rm -rf $(EXAMPLE)/robustness_benchmark $(EXAMPLE)/robustness_downlink
 	rm -rf $(EXAMPLE)/models/candidate_bundle $(EXAMPLE)/models/bundles

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "phi2-eo-tile-filter"
 version = "0.2.0"
 description = "Deterministic EO tile triage demonstrator with ONNX INT8 deployment and assurance checks."
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
   "torch>=2.9,<3",
   "numpy>=1.26,<3",
