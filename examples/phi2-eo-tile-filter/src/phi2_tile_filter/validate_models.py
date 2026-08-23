@@ -12,10 +12,10 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from .bandwidth_filter import load_policy
+from .bandwidth_filter import load_policy_artifact
 from .policy import DecisionPolicy, softmax
 from .runtime import OnnxRunner
-from .utils import discover_labeled_tiles, load_tile_numpy, sha256_file
+from .utils import discover_labeled_tiles, load_tile_numpy
 
 
 def _classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, event_scores: np.ndarray) -> dict:
@@ -113,8 +113,7 @@ def validate_models(
     if fp32.band_ids != int8.band_ids:
         raise ValueError("FP32 and INT8 model band ordering differs")
     int8.assert_data_schema(data_root)
-    policy = load_policy(policy_path, int8)
-    policy_sha256 = sha256_file(policy_path)
+    policy, _, policy_sha256 = load_policy_artifact(policy_path, int8)
 
     items = discover_labeled_tiles(data_root)
     if not items:
