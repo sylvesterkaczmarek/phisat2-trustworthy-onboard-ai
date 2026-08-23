@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -29,7 +30,14 @@ def load_policy_artifact(
     runner: OnnxRunner,
 ) -> tuple[DecisionPolicy, dict, str]:
     path = Path(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw = path.read_bytes()
+    policy_sha = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid calibration policy JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("calibration policy must be a JSON object")
     schema_version = payload.get("schema_version")
     if schema_version not in (4, 5):
         raise ValueError(
@@ -63,7 +71,7 @@ def load_policy_artifact(
         temperature=float(payload["temperature"]),
         input_quality_guard=quality_guard,
     )
-    return policy, payload, sha256_file(path)
+    return policy, payload, policy_sha
 
 
 def load_policy(path: str | Path, runner: OnnxRunner) -> DecisionPolicy:
