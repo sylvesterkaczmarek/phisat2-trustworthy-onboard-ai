@@ -228,7 +228,7 @@ def _summary_fixture(tmp_path: Path) -> tuple[Path, Path, list[dict], list[dict]
     for sample, (retained, quality_ok) in zip(samples, decisions):
         source = tmp_path / sample["file"]
         source.parent.mkdir(parents=True, exist_ok=True)
-        content = sample["file"].encode("utf-8")
+        content = sample["file"].encode("utf-8").ljust(64, b"_")
         source.write_bytes(content)
         records.append(
             _downlink_record(
