@@ -21,7 +21,7 @@ def evaluate(model: str | Path, data: str | Path, *, temperature: float = 1.0) -
     y_true: list[int] = []
     y_pred: list[int] = []
     event_scores: list[float] = []
-    latencies: list[float] = []
+    onnx_latencies: list[float] = []
     for path, cls in items:
         array = load_tile_numpy(path, input_schema=runner.input_schema)
         logits, latency = runner.logits_for_array(array)
@@ -29,13 +29,13 @@ def evaluate(model: str | Path, data: str | Path, *, temperature: float = 1.0) -
         y_true.append(cls)
         y_pred.append(int(probs.argmax()))
         event_scores.append(float(probs[1]))
-        latencies.append(latency)
+        onnx_latencies.append(latency)
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=[1], average=None, zero_division=0
     )
     auc = float(roc_auc_score(y_true, event_scores)) if len(set(y_true)) == 2 else None
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model_sha256": runner.model_sha256,
         "input_schema_sha256": runner.input_schema_sha256,
         "input_band_ids": list(runner.band_ids),
@@ -47,14 +47,22 @@ def evaluate(model: str | Path, data: str | Path, *, temperature: float = 1.0) -
         "event_f1": float(f1[0]),
         "auc_roc": auc,
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist(),
-        "avg_latency_ms": float(np.mean(latencies)),
-        "p95_latency_ms": float(np.percentile(latencies, 95)),
+        "timing_scope": "onnxruntime_session_run_only",
+        "execution_provider": runner.selected_execution_provider,
+        "host_measurement_only": True,
+        "spacecraft_timing_measured": False,
+        "onnx_inference_latency_ms": {
+            "avg": float(np.mean(onnx_latencies)),
+            "p95": float(np.percentile(onnx_latencies, 95)),
+        },
     }
     return result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Evaluate classification metrics; latency is ONNX Runtime session.run host timing only."
+    )
     parser.add_argument("--onnx", required=True)
     parser.add_argument("--data", required=True)
     parser.add_argument("--temperature", type=float, default=1.0)
