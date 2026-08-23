@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from phi2_tile_filter.input_schema import build_input_schema, write_input_schema
+from phi2_tile_filter.input_schema import build_input_schema, input_schema_sha256, write_input_schema
 from phi2_tile_filter.policy import DecisionPolicy
 from phi2_tile_filter.quality_guard import calibrate_input_quality_guard
 from phi2_tile_filter.robustness_benchmark import generate_benchmark, summarize_benchmark
@@ -106,9 +106,11 @@ def _downlink_record(
     *,
     retained: bool,
     quality_ok: bool,
-    size_bytes: int = 100,
+    input_hash: str,
+    size_bytes: int,
+    schema_hash: str,
+    model_hash: str = "b" * 64,
 ) -> dict:
-    input_hash = hashlib.sha256(file_name.encode()).hexdigest()
     decision = (
         "input_quality_fallback"
         if not quality_ok
@@ -120,9 +122,9 @@ def _downlink_record(
         "file": file_name,
         "deployment_bundle_id": "a" * 64,
         "deployment_bundle_verified": True,
-        "model_sha256": "b" * 64,
+        "model_sha256": model_hash,
         "policy_sha256": "c" * 64,
-        "input_schema_sha256": "d" * 64,
+        "input_schema_sha256": schema_hash,
         "input_schema_file_sha256": "e" * 64,
         "preprocessing_sha256": "f" * 64,
         "input_band_ids": ["band_01"],
@@ -165,30 +167,86 @@ def _downlink_record(
     }
 
 
-def test_prevalence_simulation_uses_source_bytes_and_not_link_bandwidth(tmp_path: Path) -> None:
+def _summary_fixture(tmp_path: Path) -> tuple[Path, Path, list[dict], list[dict]]:
+    schema = build_input_schema(bands=1, height=8)
+    schema_hash = write_input_schema(tmp_path / "input_schema.json", schema)
+    assert schema_hash == input_schema_sha256(schema)
     samples = [
-        {"file": "nominal/background/0.npy", "category": "nominal", "true_class": 0, "true_class_name": "background", "perturbations": []},
-        {"file": "nominal/event/0.npy", "category": "nominal", "true_class": 1, "true_class_name": "event", "perturbations": []},
-        {"file": "degraded/background/0.npy", "category": "degraded", "true_class": 0, "true_class_name": "background", "perturbations": ["sensor_noise"]},
-        {"file": "corrupted/background/0.npy", "category": "corrupted", "true_class": 0, "true_class_name": "background", "perturbations": ["dead_pixel_stripe"]},
-        {"file": "ood/unknown/0.npy", "category": "ood", "true_class": None, "true_class_name": "unknown", "perturbations": ["unknown_checkerboard_background"]},
+        {
+            "file": "nominal/background/0.npy",
+            "category": "nominal",
+            "true_class": 0,
+            "true_class_name": "background",
+            "perturbations": [],
+        },
+        {
+            "file": "nominal/event/0.npy",
+            "category": "nominal",
+            "true_class": 1,
+            "true_class_name": "event",
+            "perturbations": [],
+        },
+        {
+            "file": "degraded/background/0.npy",
+            "category": "degraded",
+            "true_class": 0,
+            "true_class_name": "background",
+            "perturbations": ["sensor_noise"],
+        },
+        {
+            "file": "corrupted/background/0.npy",
+            "category": "corrupted",
+            "true_class": 0,
+            "true_class_name": "background",
+            "perturbations": ["dead_pixel_stripe"],
+        },
+        {
+            "file": "ood/unknown/0.npy",
+            "category": "ood",
+            "true_class": None,
+            "true_class_name": "unknown",
+            "perturbations": ["unknown_checkerboard_background"],
+        },
     ]
     manifest = {
         "schema_version": 1,
         "benchmark_name": "deterministic-eo-robustness-v1",
+        "input_schema_sha256": schema_hash,
         "samples": samples,
     }
-    manifest_path = tmp_path / "manifest.json"
+    manifest_path = tmp_path / "benchmark_manifest.json"
     manifest_path.write_text(json.dumps(manifest))
-    records = [
-        _downlink_record(samples[0]["file"], retained=False, quality_ok=True),
-        _downlink_record(samples[1]["file"], retained=True, quality_ok=True),
-        _downlink_record(samples[2]["file"], retained=True, quality_ok=False),
-        _downlink_record(samples[3]["file"], retained=True, quality_ok=False),
-        _downlink_record(samples[4]["file"], retained=True, quality_ok=False),
+
+    decisions = [
+        (False, True),
+        (True, True),
+        (True, False),
+        (True, False),
+        (True, False),
     ]
+    records: list[dict] = []
+    for sample, (retained, quality_ok) in zip(samples, decisions):
+        source = tmp_path / sample["file"]
+        source.parent.mkdir(parents=True, exist_ok=True)
+        content = sample["file"].encode("utf-8")
+        source.write_bytes(content)
+        records.append(
+            _downlink_record(
+                sample["file"],
+                retained=retained,
+                quality_ok=quality_ok,
+                input_hash=hashlib.sha256(content).hexdigest(),
+                size_bytes=len(content),
+                schema_hash=schema_hash,
+            )
+        )
     log = tmp_path / "benchmark.jsonl"
     log.write_text("".join(json.dumps(record) + "\n" for record in records))
+    return manifest_path, log, samples, records
+
+
+def test_prevalence_simulation_uses_source_bytes_and_not_link_bandwidth(tmp_path: Path) -> None:
+    manifest_path, log, _, _ = _summary_fixture(tmp_path)
     result = summarize_benchmark(manifest_path, log, event_prevalences=(0.10,))
     scenario = result["prevalence_simulation"]["scenarios"][0]
     assert scenario["expected_retained_fraction"] == pytest.approx(0.10)
@@ -196,3 +254,21 @@ def test_prevalence_simulation_uses_source_bytes_and_not_link_bandwidth(tmp_path
     assert result["prevalence_simulation"]["operational_link_bandwidth_measured"] is False
     assert result["categories"]["ood"]["ood_detection_rate"] == 1.0
     assert "source_bytes_reduction_fraction" in result["categories"]["nominal"]
+    assert result["telemetry_integrity"]["benchmark_input_hashes_verified"] is True
+
+
+def test_robustness_summary_rejects_mixed_model_identity(tmp_path: Path) -> None:
+    manifest_path, log, _, records = _summary_fixture(tmp_path)
+    records[1]["model_sha256"] = "9" * 64
+    log.write_text("".join(json.dumps(record) + "\n" for record in records))
+    with pytest.raises(ValueError, match="inconsistent model_sha256"):
+        summarize_benchmark(manifest_path, log)
+
+
+def test_robustness_summary_rejects_manifest_schema_mismatch(tmp_path: Path) -> None:
+    manifest_path, log, _, _ = _summary_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["input_schema_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="manifest input schema hash"):
+        summarize_benchmark(manifest_path, log)
