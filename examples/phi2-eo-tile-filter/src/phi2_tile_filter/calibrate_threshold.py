@@ -10,6 +10,7 @@ from scipy.stats import beta
 from sklearn.metrics import precision_score, recall_score, roc_auc_score
 
 from .policy import DecisionPolicy, softmax
+from .quality_guard import calibrate_input_quality_guard
 from .runtime import OnnxRunner
 from .utils import discover_labeled_tiles, load_tile_numpy
 
@@ -63,6 +64,8 @@ def calibrate(
     fit_temp: bool = True,
     confidence_level: float = 0.95,
     min_event_recall_lower_bound: float | None = None,
+    quality_guard_quantile: float = 0.99,
+    quality_guard_margin: float = 1.25,
 ) -> dict:
     if not (0.0 < target_recall <= 1.0):
         raise ValueError("target_recall must be in (0, 1]")
@@ -74,6 +77,10 @@ def calibrate(
         0.0 <= min_event_recall_lower_bound <= 1.0
     ):
         raise ValueError("min_event_recall_lower_bound must be in [0, 1]")
+    if not 0.0 < quality_guard_quantile <= 1.0:
+        raise ValueError("quality_guard_quantile must be in (0, 1]")
+    if quality_guard_margin < 1.0:
+        raise ValueError("quality_guard_margin must be >= 1")
 
     runner = OnnxRunner(model_path)
     runner.assert_data_schema(data_root)
@@ -82,9 +89,11 @@ def calibrate(
         raise ValueError("calibration set is empty")
     labels: list[int] = []
     logits_list: list[np.ndarray] = []
+    arrays: list[np.ndarray] = []
     for path, cls in items:
         array = load_tile_numpy(path, input_schema=runner.input_schema)
         logits, _ = runner.logits_for_array(array)
+        arrays.append(array)
         logits_list.append(logits[0])
         labels.append(cls)
     y = np.asarray(labels, dtype=np.int64)
@@ -109,14 +118,24 @@ def calibrate(
     )
     precision = float(precision_score(y, predicted_event, pos_label=1, zero_division=0))
     auc = float(roc_auc_score(y, scores))
-    policy = DecisionPolicy(threshold, min_confidence=min_confidence, temperature=temperature)
+    quality_guard = calibrate_input_quality_guard(
+        arrays,
+        threshold_quantile=quality_guard_quantile,
+        threshold_margin=quality_guard_margin,
+    )
+    policy = DecisionPolicy(
+        threshold,
+        min_confidence=min_confidence,
+        temperature=temperature,
+        input_quality_guard=quality_guard,
+    )
 
     accepted = (
         min_event_recall_lower_bound is None
         or recall_lower_bound >= min_event_recall_lower_bound
     )
     result = {
-        "schema_version": 4,
+        "schema_version": 5,
         "split_role": "calibration",
         "model_sha256": runner.model_sha256,
         "input_schema_sha256": runner.input_schema_sha256,
@@ -128,6 +147,7 @@ def calibrate(
         "min_confidence": policy.min_confidence,
         "temperature": policy.temperature,
         "temperature_fitted": bool(fit_temp),
+        "input_quality_guard": quality_guard.to_payload(),
         "calibration_statistics": {
             "samples_total": int(y.size),
             "event_samples": event_count,
@@ -161,6 +181,8 @@ def main() -> None:
     parser.add_argument("--min-confidence", type=float, default=0.60)
     parser.add_argument("--confidence-level", type=float, default=0.95)
     parser.add_argument("--min-event-recall-lower-bound", type=float, default=None)
+    parser.add_argument("--quality-guard-quantile", type=float, default=0.99)
+    parser.add_argument("--quality-guard-margin", type=float, default=1.25)
     parser.add_argument("--no-fit-temperature", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("calibration.json"))
     args = parser.parse_args()
@@ -172,6 +194,8 @@ def main() -> None:
         fit_temp=not args.no_fit_temperature,
         confidence_level=args.confidence_level,
         min_event_recall_lower_bound=args.min_event_recall_lower_bound,
+        quality_guard_quantile=args.quality_guard_quantile,
+        quality_guard_margin=args.quality_guard_margin,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

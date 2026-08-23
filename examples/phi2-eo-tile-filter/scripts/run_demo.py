@@ -26,6 +26,8 @@ def main() -> None:
     parser.add_argument("--min-confidence", type=float, default=0.60)
     parser.add_argument("--calibration-confidence-level", type=float, default=0.95)
     parser.add_argument("--min-calibration-recall-lower-bound", type=float, default=None)
+    parser.add_argument("--quality-guard-quantile", type=float, default=0.99)
+    parser.add_argument("--quality-guard-margin", type=float, default=1.25)
     parser.add_argument("--max-accuracy-drop", type=float, default=0.05)
     parser.add_argument("--min-argmax-agreement", type=float, default=0.95)
     parser.add_argument("--max-event-recall-drop", type=float, default=0.05)
@@ -138,6 +140,10 @@ def main() -> None:
         str(args.min_confidence),
         "--confidence-level",
         str(args.calibration_confidence_level),
+        "--quality-guard-quantile",
+        str(args.quality_guard_quantile),
+        "--quality-guard-margin",
+        str(args.quality_guard_margin),
         "--out",
         str(calibration),
     ]
@@ -276,15 +282,22 @@ def main() -> None:
     calibration_result = json.loads(active_policy.read_text(encoding="utf-8"))
     validation_result = json.loads((reports / "model_validation.json").read_text(encoding="utf-8"))
     final_test_metrics = json.loads((reports / "metrics.json").read_text(encoding="utf-8"))
+    guard = calibration_result.get("input_quality_guard", {})
     result = {
         "active_bundle_id": active_bundle_id,
         "split_counts": manifest["split_counts"],
         "split_roles": manifest["split_roles"],
         "calibration_statistics": calibration_result["calibration_statistics"],
         "calibration_acceptance": calibration_result["calibration_acceptance"],
+        "input_quality_guard": {
+            "method": guard.get("method"),
+            "threshold": guard.get("threshold"),
+            "calibration_samples": guard.get("calibration_samples"),
+        },
         "validation_acceptance": {
             "accepted": validation_result["accepted"],
             "acceptance_checks": validation_result["acceptance_checks"],
+            "input_quality_guard_validation": validation_result.get("input_quality_guard_validation"),
             "classification_quantization_regression": validation_result["classification_metrics"][
                 "quantization_regression"
             ],

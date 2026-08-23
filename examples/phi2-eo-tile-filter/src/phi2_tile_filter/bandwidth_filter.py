@@ -14,6 +14,7 @@ from .filesystem import (
     sibling_stage_path,
 )
 from .policy import DecisionPolicy
+from .quality_guard import InputQualityGuard
 from .runtime import OnnxRunner
 from .telemetry import (
     DOWNLINK_RECORD_KIND,
@@ -29,7 +30,8 @@ def load_policy_artifact(
 ) -> tuple[DecisionPolicy, dict, str]:
     path = Path(path)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 4:
+    schema_version = payload.get("schema_version")
+    if schema_version not in (4, 5):
         raise ValueError(
             "unsupported calibration policy schema; policies must include an explicit input/preprocessing contract"
         )
@@ -50,10 +52,16 @@ def load_policy_artifact(
     acceptance = payload.get("calibration_acceptance")
     if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
         raise ValueError("calibration policy is not marked accepted")
+
+    quality_guard = None
+    if schema_version == 5:
+        quality_guard = InputQualityGuard.from_payload(payload.get("input_quality_guard"))
+
     policy = DecisionPolicy(
         event_threshold=float(payload["event_threshold"]),
         min_confidence=float(payload["min_confidence"]),
         temperature=float(payload["temperature"]),
+        input_quality_guard=quality_guard,
     )
     return policy, payload, sha256_file(path)
 
@@ -107,9 +115,10 @@ def filter_tiles(
     log_stage.parent.mkdir(parents=True, exist_ok=True)
 
     total_bytes = 0
-    kept_bytes = 0
-    kept_count = 0
+    retained_bytes = 0
+    retained_count = 0
     fallback_count = 0
+    quality_fallback_count = 0
     failure_count = 0
     copy_failure_count = 0
     unknown_size_files = 0
@@ -136,6 +145,8 @@ def filter_tiles(
 
                 if str(record["decision"]).endswith("fallback"):
                     fallback_count += 1
+                if record["decision"] == "input_quality_fallback":
+                    quality_fallback_count += 1
                 if not record["inference_ok"]:
                     failure_count += 1
 
@@ -159,9 +170,9 @@ def filter_tiles(
                             )
                         record["downlink_materialized"] = True
                         record["retained_for_downlink"] = True
-                        kept_count += 1
+                        retained_count += 1
                         if isinstance(size_bytes, int):
-                            kept_bytes += size_bytes
+                            retained_bytes += size_bytes
                     except Exception as exc:
                         copy_failure_count += 1
                         record["downlink_error"] = f"{type(exc).__name__}: {exc}"
@@ -186,9 +197,11 @@ def filter_tiles(
         remove_stage(stage_root)
         remove_stage(log_stage)
 
-    saved_fraction = 1.0 - kept_bytes / total_bytes if total_bytes else 0.0
+    source_bytes_reduction_fraction = (
+        1.0 - retained_bytes / total_bytes if total_bytes else 0.0
+    )
     summary = {
-        "schema_version": 4,
+        "schema_version": 5,
         "deployment_bundle_id": identity["deployment_bundle_id"],
         "deployment_bundle_verified": identity["deployment_bundle_verified"],
         "model_sha256": runner.model_sha256,
@@ -197,15 +210,17 @@ def filter_tiles(
         "input_schema_file_sha256": runner.input_schema_file_sha256,
         "preprocessing_sha256": runner.preprocessing_sha256,
         "tiles_total": len(files),
-        "tiles_kept": kept_count,
+        "tiles_retained": retained_count,
         "fallback_tiles": fallback_count,
+        "input_quality_fallback_tiles": quality_fallback_count,
         "inference_failures": failure_count,
         "downlink_materialization_failures": copy_failure_count,
-        "bytes_total": total_bytes,
-        "bytes_kept": kept_bytes,
-        "bytes_accounting_complete": unknown_size_files == 0,
+        "source_bytes_total": total_bytes,
+        "source_bytes_retained": retained_bytes,
+        "source_bytes_accounting_complete": unknown_size_files == 0,
         "unknown_size_files": unknown_size_files,
-        "bandwidth_saved_fraction": saved_fraction,
+        "source_bytes_reduction_fraction": source_bytes_reduction_fraction,
+        "operational_link_bandwidth_measured": False,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     return summary

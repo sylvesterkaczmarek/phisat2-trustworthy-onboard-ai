@@ -119,13 +119,9 @@ class OnnxRunner:
         deployment_bundle_verified: bool = False,
         record_kind: str = DOWNLINK_RECORD_KIND,
     ) -> dict:
-        """Evaluate one input without allowing file/I/O failures to escape.
-
-        File stat, hashing, preprocessing, inference, and decision stages are all
-        inside the conservative fallback boundary. The record distinguishes a
-        requested fallback retention from later downlink materialization.
-        """
+        """Evaluate one input without allowing file/I/O failures to escape."""
         path = Path(path)
+        guard = policy.input_quality_guard
         record: dict[str, Any] = {
             "schema_version": TELEMETRY_RECORD_SCHEMA_VERSION,
             "record_kind": record_kind,
@@ -146,6 +142,11 @@ class OnnxRunner:
             "event_threshold": policy.event_threshold,
             "min_confidence": policy.min_confidence,
             "temperature": policy.temperature,
+            "input_quality_guard_enabled": guard is not None,
+            "input_quality_method": None if guard is None else guard.method,
+            "input_quality_score": None,
+            "input_quality_threshold": None if guard is None else float(guard.threshold),
+            "input_quality_ok": None,
             "inference_ok": False,
             "error": None,
             "error_type": None,
@@ -180,6 +181,17 @@ class OnnxRunner:
                 record["input_observation_ok"] = False
                 raise RuntimeError("input file changed while it was being preprocessed")
 
+            input_quality_ok: bool | None = True
+            if guard is not None:
+                failure_stage = "input_quality_guard"
+                assessment = guard.assess(array)
+                input_quality_ok = bool(assessment.in_distribution)
+                record["input_quality_score"] = float(assessment.score)
+                record["input_quality_threshold"] = float(assessment.threshold)
+                record["input_quality_ok"] = input_quality_ok
+            else:
+                record["input_quality_ok"] = True
+
             failure_stage = "onnx_inference"
             logits, latency_ms = self.logits_for_array(array)
             probabilities = softmax(logits, temperature=policy.temperature)[0]
@@ -191,6 +203,7 @@ class OnnxRunner:
                 prob_event=prob_event,
                 max_prob=max_prob,
                 inference_ok=True,
+                input_quality_ok=input_quality_ok,
             )
             record.update(
                 {
@@ -212,6 +225,7 @@ class OnnxRunner:
                 prob_event=float("nan"),
                 max_prob=float("nan"),
                 inference_ok=False,
+                input_quality_ok=None,
             )
             record.update(
                 {
