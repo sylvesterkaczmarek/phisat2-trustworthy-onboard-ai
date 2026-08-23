@@ -130,7 +130,7 @@ The ordinary square-event generator remains the fast deterministic default. The 
 - **corrupted**: missing/corrupt bands, saturation, and dead-pixel/stripe patterns;
 - **OOD**: deterministic checkerboard, sinusoidal, radial, and striped unknown backgrounds with changed spectral structure.
 
-The benchmark reports event retention, background rejection, fallback rate, quality/degradation detection, inference failures, and source-file byte retention separately by category.
+The benchmark reports event retention, background rejection, fallback rate, quality/degradation detection, inference failures, and source-file byte retention separately by category. Its summarizer also requires all records to share one bundle/model/policy/schema identity and re-hashes every benchmark source file before reporting.
 
 These perturbations are simulation tools only. They are **not physically calibrated sensor, atmosphere, optics, cloud, compression, radiation, or spacecraft models**.
 
@@ -158,18 +158,21 @@ Runtime telemetry distinguishes:
 - probability/policy evaluation latency;
 - end-to-end per-tile wall-clock latency.
 
-The standalone `bench_onnxruntime` benchmark measures only ONNX Runtime `session.run` on an in-memory tensor. All timing is labelled as host measurement. Desktop/CI CPU results are **not spacecraft timing, WCET, or hardware qualification evidence**.
+The standalone `bench_onnxruntime` benchmark and `infer_onnx` utility label ONNX Runtime `session.run` latency explicitly. All timing is labelled as host measurement. Desktop/CI CPU results are **not spacecraft timing, WCET, or hardware qualification evidence**.
 
 ## Using real EO data
 
-The synthetic generator is optional infrastructure, not a required model interface. To substitute real EO data:
+The synthetic generator is optional infrastructure, not a required model interface. The current reference trainer is intentionally a binary `background` versus `event` demonstration, so a replacement dataset must preserve the repository's current lifecycle and directory contract unless the training code itself is adapted.
 
-1. create independent train/calibration/validation/final-test partitions;
-2. represent supported data as arrays under an explicit `input_schema.json`;
-3. replace generic band IDs with validated sensor-specific band identity/order and, where available, wavelength metadata;
-4. define real radiometric range/scaling, normalization, nodata, and preprocessing semantics in the schema;
-5. run the individual training, ONNX export, quantization, calibration, validation, bundle, and telemetry stages against those partitions;
-6. keep the final test outside model/policy acceptance decisions.
+For the current implementation:
+
+1. create independent `train`, `calib`, `validation`, and `test` partitions;
+2. under each partition, place labelled samples in `background/` and `event/` directories;
+3. provide a root `manifest.json` declaring the four split counts/roles and a root `input_schema.json` whose canonical hash matches the manifest;
+4. represent supported source data under that explicit schema, replacing generic band IDs with validated sensor-specific band identity/order and, where available, wavelength metadata;
+5. define real radiometric range/scaling, normalization, nodata, and preprocessing semantics in the schema;
+6. run training, ONNX export, quantization, calibration, validation, bundle, and telemetry stages against those partitions;
+7. keep the final test outside model/policy acceptance decisions.
 
 The generic loader deliberately rejects TIFF/GeoTIFF rather than silently reducing scientific imagery through generic 8-bit PIL conversion. Real scientific TIFF/GeoTIFF should use a sensor-aware ingest implementation that preserves band identity, bit depth, scale/offset, nodata, and geospatial metadata.
 
@@ -183,7 +186,9 @@ A deployable bundle contains the exact:
 - `validation.json`;
 - `bundle.json` manifest.
 
-Promotion verifies the bundle before atomically changing the active bundle pointer. Rollback changes the complete bundle, so an old model cannot intentionally be paired with a newer policy or preprocessing contract.
+Validation evidence records the SHA-256 of the exact calibration-policy artifact used for validation. Bundle construction rejects evidence generated under a different threshold/confidence/quality-guard policy, even when the model and input schema are otherwise identical.
+
+Promotion verifies the new bundle and the currently active stored bundle before atomically changing the active pointer, so a corrupted active bundle is not silently preserved as the claimed rollback target. Runtime only reports `deployment_bundle_verified: true` after validating the complete local bundle manifest and all component hashes, including validation evidence.
 
 Runtime telemetry identifies the deployment bundle, model, policy, semantic input contract, exact schema file, preprocessing fingerprint, and observed input file. The final summarizer refuses to combine inconsistent final-test/downlink records.
 
