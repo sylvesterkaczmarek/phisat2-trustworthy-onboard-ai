@@ -104,6 +104,15 @@ def _verify_telemetry_integrity(
     calibration: dict,
     calibration_path: str | Path,
 ) -> tuple[dict[str, dict], dict[str, dict], dict]:
+    # Surface a declared scientific-contract mismatch before record-version errors.
+    # Old telemetry is still rejected below when the contracts agree.
+    declared_test_schema = _one_value(test, "input_schema_sha256")
+    declared_down_schema = _one_value(downlink, "input_schema_sha256")
+    if declared_test_schema != declared_down_schema:
+        raise ValueError("final-test/downlink input schema hash mismatch")
+    if calibration.get("input_schema_sha256") != declared_test_schema:
+        raise ValueError("calibration input/preprocessing schema differs from final-test runtime")
+
     for record in test:
         validate_telemetry_record(
             record,
@@ -143,8 +152,6 @@ def _verify_telemetry_integrity(
         raise ValueError("telemetry policy hash does not match the calibration policy artifact")
     if calibration.get("model_sha256") != identity["model_sha256"]:
         raise ValueError("calibration belongs to a different model")
-    if calibration.get("input_schema_sha256") != identity["input_schema_sha256"]:
-        raise ValueError("calibration input/preprocessing schema differs from runtime telemetry")
 
     for file_name in sorted(test_by_file):
         test_record = test_by_file[file_name]
