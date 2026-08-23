@@ -36,11 +36,29 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
         cwd=example_root,
         check=True,
     )
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_robustness_benchmark.py",
+            "--output-root",
+            str(output),
+            "--samples-per-category",
+            "4",
+            "--seed",
+            "17",
+            "--event-prevalences",
+            "0.01,0.10",
+        ],
+        cwd=example_root,
+        check=True,
+    )
+
     manifest = json.loads((output / "tiles" / "manifest.json").read_text())
     source_schema = read_input_schema(output / "tiles" / "input_schema.json")
     source_schema_hash = input_schema_sha256(source_schema)
     metrics = json.loads((output / "reports" / "metrics.json").read_text())
     validation = json.loads((output / "reports" / "model_validation.json").read_text())
+    robustness = json.loads((output / "reports" / "robustness_benchmark.json").read_text())
     state = json.loads((output / "models" / "deployment_state.json").read_text())
     active_bundle = output / "models" / "bundles" / state["active_bundle_id"]
     bundle_manifest = json.loads((active_bundle / "bundle.json").read_text())
@@ -53,11 +71,15 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert manifest["input_schema_sha256"] == source_schema_hash
     assert manifest["input_band_ids"] == [f"band_{index:02d}" for index in range(1, 8)]
 
+    assert metrics["schema_version"] == 6
     assert metrics["split_role"] == "final_test"
     assert metrics["input_schema_sha256"] == source_schema_hash
     assert metrics["final_test_sample_counts"]["samples_total"] == manifest["split_counts"]["test"]
     assert metrics["final_test_sample_counts"]["inference_failures"] == 0
-    assert 0.0 <= metrics["final_test_downlink_retention_metrics"]["downlink_bytes_saved_pct"] <= 100.0
+    retention = metrics["final_test_downlink_retention_metrics"]
+    assert 0.0 <= retention["source_bytes_reduction_pct"] <= 100.0
+    assert retention["operational_link_bandwidth_measured"] is False
+    assert metrics["final_test_input_quality_metrics"]["guard_enabled"] is True
 
     assert validation["schema_version"] == 3
     assert validation["split_role"] == "validation"
@@ -66,11 +88,13 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert validation["validation_samples"] == manifest["split_counts"]["validation"]
     assert validation["accepted"] is True
     assert all(validation["acceptance_checks"].values())
+    assert validation["input_quality_guard_validation"]["enabled"] is True
 
-    assert active_policy["schema_version"] == 4
+    assert active_policy["schema_version"] == 5
     assert active_policy["split_role"] == "calibration"
     assert active_policy["input_schema_sha256"] == source_schema_hash
     assert active_policy["input_band_ids"] == manifest["input_band_ids"]
+    assert active_policy["input_quality_guard"]["method"] == "diagonal-standardized-input-statistics-v1"
     stats = active_policy["calibration_statistics"]
     assert stats["event_samples"] > 0
     assert 0.0 <= stats["event_recall_lower_bound"] <= stats["empirical_event_recall"] <= 1.0
@@ -85,3 +109,16 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert model_input_schema_sha256(active_bundle / "model.onnx") == active_schema_hash
     assert active_schema["preprocessing"]["channel_policy"] == "exact-no-implicit-conversion"
     assert active_schema["preprocessing"]["tiff_policy"] == "reject-use-npy-or-mission-specific-loader"
+
+    assert robustness["simulation_only"] is True
+    assert robustness["physical_sensor_fidelity_claimed"] is False
+    assert robustness["input_quality_guard_enabled"] is True
+    assert set(robustness["categories"]) == {"nominal", "degraded", "corrupted", "ood"}
+    for category in robustness["categories"].values():
+        assert "source_bytes_reduction_fraction" in category
+        assert "fallback_rate" in category
+        assert "quality_or_preprocessing_detection_rate" in category
+    assert robustness["categories"]["corrupted"]["degradation_detection_rate"] >= 0.25
+    scenarios = robustness["prevalence_simulation"]["scenarios"]
+    assert [scenario["event_prevalence"] for scenario in scenarios] == [0.01, 0.10]
+    assert robustness["prevalence_simulation"]["operational_link_bandwidth_measured"] is False
