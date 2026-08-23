@@ -4,14 +4,17 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .quality_guard import InputQualityGuard
+
 
 @dataclass(frozen=True)
 class DecisionPolicy:
-    """Policy for event downlink plus conservative uncertainty fallback."""
+    """Policy for event downlink plus conservative uncertainty/input-quality fallback."""
 
     event_threshold: float
     min_confidence: float = 0.60
     temperature: float = 1.0
+    input_quality_guard: InputQualityGuard | None = None
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.event_threshold <= 1.0):
@@ -21,9 +24,18 @@ class DecisionPolicy:
         if not np.isfinite(self.temperature) or self.temperature <= 0.0:
             raise ValueError("temperature must be finite and positive")
 
-    def decide(self, *, prob_event: float, max_prob: float, inference_ok: bool = True) -> tuple[bool, str]:
+    def decide(
+        self,
+        *,
+        prob_event: float,
+        max_prob: float,
+        inference_ok: bool = True,
+        input_quality_ok: bool | None = True,
+    ) -> tuple[bool, str]:
         if not inference_ok:
             return True, "inference_failure_fallback"
+        if input_quality_ok is False:
+            return True, "input_quality_fallback"
         if not np.isfinite(prob_event) or not np.isfinite(max_prob):
             return True, "invalid_probability_fallback"
         if prob_event >= self.event_threshold:
