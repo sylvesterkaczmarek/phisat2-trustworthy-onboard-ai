@@ -215,6 +215,7 @@ def main() -> None:
     active = resolve_bundle(bundle_store, deployment_state, slot="active")
     active_model = Path(active["model"])
     active_policy = Path(active["policy"])
+    active_bundle_id = str(active["bundle_id"])
 
     # The final test split is touched only after the candidate has passed calibration,
     # validation, bundle verification, and promotion.
@@ -228,6 +229,8 @@ def main() -> None:
             str(tiles / "test"),
             "--policy",
             str(active_policy),
+            "--bundle-id",
+            active_bundle_id,
             "--out",
             str(logs / "test.jsonl"),
         ],
@@ -244,6 +247,8 @@ def main() -> None:
             str(tiles / "test"),
             "--policy",
             str(active_policy),
+            "--bundle-id",
+            active_bundle_id,
             "--downlink-out",
             str(downlink),
             "--log",
@@ -272,7 +277,7 @@ def main() -> None:
     validation_result = json.loads((reports / "model_validation.json").read_text(encoding="utf-8"))
     final_test_metrics = json.loads((reports / "metrics.json").read_text(encoding="utf-8"))
     result = {
-        "active_bundle_id": active["bundle_id"],
+        "active_bundle_id": active_bundle_id,
         "split_counts": manifest["split_counts"],
         "split_roles": manifest["split_roles"],
         "calibration_statistics": calibration_result["calibration_statistics"],
