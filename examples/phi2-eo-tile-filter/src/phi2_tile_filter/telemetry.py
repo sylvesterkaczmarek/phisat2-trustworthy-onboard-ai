@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import string
@@ -14,6 +15,7 @@ FINAL_TEST_RECORD_KIND = "final_test_inference"
 DOWNLINK_RECORD_KIND = "downlink_decision"
 
 _HEX = set(string.hexdigits.lower())
+_BUNDLE_COMPONENTS = {"model", "policy", "input_schema", "validation"}
 _TIMING_KEYS = (
     "input_observation_latency_ms",
     "preprocessing_latency_ms",
@@ -33,6 +35,86 @@ def _read_json_object(path: str | Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"expected JSON object in {path}")
     return payload
+
+
+def _bundle_id(manifest: dict[str, Any]) -> str:
+    core = {key: value for key, value in manifest.items() if key != "bundle_id"}
+    canonical = json.dumps(
+        core,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _bundle_component(bundle_dir: Path, descriptor: Any, name: str) -> Path:
+    if not isinstance(descriptor, dict):
+        raise ValueError(f"deployment bundle is missing {name} component metadata")
+    relative = descriptor.get("path")
+    expected_sha = descriptor.get("sha256")
+    if not isinstance(relative, str) or not relative:
+        raise ValueError(f"deployment bundle has invalid {name} component path")
+    if not _is_sha256(expected_sha):
+        raise ValueError(f"deployment bundle has invalid {name} component hash")
+    rel = Path(relative)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError(f"deployment bundle has unsafe {name} component path")
+    resolved = (bundle_dir / rel).resolve(strict=False)
+    root = bundle_dir.resolve(strict=False)
+    if root not in resolved.parents or not resolved.is_file():
+        raise FileNotFoundError(f"deployment bundle {name} component not found: {resolved}")
+    if sha256_file(resolved) != expected_sha:
+        raise ValueError(f"deployment bundle {name} component hash mismatch")
+    return resolved
+
+
+def _verify_bundle_manifest_integrity(
+    bundle_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    model: Path,
+    policy: Path,
+    schema: Path,
+    model_sha256: str,
+    policy_sha256: str,
+    input_schema_sha256: str,
+    schema_file_sha256: str,
+    explicit_bundle_id: str | None,
+) -> str:
+    if manifest.get("schema_version") != 2 or manifest.get("bundle_version") != 2:
+        raise ValueError("unsupported deployment bundle schema or format")
+    manifest_id = manifest.get("bundle_id")
+    if not _is_sha256(manifest_id):
+        raise ValueError("deployment bundle manifest has an invalid bundle_id")
+    if manifest_id != _bundle_id(manifest):
+        raise ValueError("deployment bundle manifest hash does not match bundle_id")
+    if explicit_bundle_id is not None and explicit_bundle_id != manifest_id:
+        raise ValueError("explicit deployment bundle id does not match bundle manifest")
+
+    components = manifest.get("components")
+    if not isinstance(components, dict) or set(components) != _BUNDLE_COMPONENTS:
+        raise ValueError("deployment bundle has incomplete components")
+    resolved = {
+        name: _bundle_component(bundle_dir, components[name], name)
+        for name in sorted(_BUNDLE_COMPONENTS)
+    }
+    expected_paths = {"model": model, "policy": policy, "input_schema": schema}
+    for name, actual in expected_paths.items():
+        if resolved[name] != actual:
+            raise ValueError(f"runtime {name} path does not match deployment bundle component")
+
+    if manifest.get("model_sha256") != model_sha256:
+        raise ValueError("deployment bundle manifest model hash does not match runtime model")
+    if manifest.get("policy_sha256") != policy_sha256:
+        raise ValueError("deployment bundle manifest policy hash does not match runtime policy")
+    if manifest.get("input_contract_sha256") != input_schema_sha256:
+        raise ValueError("deployment bundle manifest input contract does not match runtime schema")
+    if manifest.get("input_schema_file_sha256") != schema_file_sha256:
+        raise ValueError("deployment bundle manifest input-schema file hash does not match runtime schema")
+    if manifest.get("validation_sha256") != sha256_file(resolved["validation"]):
+        raise ValueError("deployment bundle validation hash does not match manifest")
+    return str(manifest_id)
 
 
 def resolve_artifact_identity(
@@ -59,31 +141,18 @@ def resolve_artifact_identity(
     manifest_path = model.parent / "bundle.json"
     if manifest_path.is_file() and policy.parent == model.parent:
         manifest = _read_json_object(manifest_path)
-        manifest_id = manifest.get("bundle_id")
-        if not _is_sha256(manifest_id):
-            raise ValueError("deployment bundle manifest has an invalid bundle_id")
-        if bundle_id is not None and bundle_id != manifest_id:
-            raise ValueError("explicit deployment bundle id does not match bundle manifest")
-        bundle_id = str(manifest_id)
-        if manifest.get("model_sha256") != model_sha256:
-            raise ValueError("deployment bundle manifest model hash does not match runtime model")
-        if manifest.get("policy_sha256") != policy_sha:
-            raise ValueError("deployment bundle manifest policy hash does not match runtime policy")
-        if manifest.get("input_contract_sha256") != input_schema_sha256:
-            raise ValueError("deployment bundle manifest input contract does not match runtime schema")
-        if manifest.get("input_schema_file_sha256") != schema_file_sha:
-            raise ValueError("deployment bundle manifest input-schema file hash does not match runtime schema")
-        components = manifest.get("components")
-        if not isinstance(components, dict):
-            raise ValueError("deployment bundle manifest is missing component descriptors")
-        expected_paths = {"model": model, "policy": policy, "input_schema": schema}
-        for name, actual in expected_paths.items():
-            descriptor = components.get(name)
-            if not isinstance(descriptor, dict) or not isinstance(descriptor.get("path"), str):
-                raise ValueError(f"deployment bundle is missing {name} component metadata")
-            declared = (model.parent / descriptor["path"]).resolve(strict=False)
-            if declared != actual:
-                raise ValueError(f"runtime {name} path does not match deployment bundle component")
+        bundle_id = _verify_bundle_manifest_integrity(
+            model.parent,
+            manifest,
+            model=model,
+            policy=policy,
+            schema=schema,
+            model_sha256=model_sha256,
+            policy_sha256=policy_sha,
+            input_schema_sha256=input_schema_sha256,
+            schema_file_sha256=schema_file_sha,
+            explicit_bundle_id=explicit_bundle_id,
+        )
         bundle_verified = True
 
     return {
@@ -108,15 +177,23 @@ def _validate_quality_evidence(record: dict[str, Any]) -> None:
     if enabled:
         if not isinstance(method, str) or not method:
             raise ValueError("enabled input quality guard requires a method")
-        if not isinstance(threshold, (int, float)) or not math.isfinite(float(threshold)) or float(threshold) < 0.0:
+        if (
+            not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or float(threshold) < 0.0
+        ):
             raise ValueError("enabled input quality guard requires a finite non-negative threshold")
         if score is not None and (
-            not isinstance(score, (int, float)) or not math.isfinite(float(score)) or float(score) < 0.0
+            not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+            or float(score) < 0.0
         ):
             raise ValueError("input quality score must be null or finite and non-negative")
         if quality_ok is not None and not isinstance(quality_ok, bool):
             raise ValueError("input_quality_ok must be null or boolean")
-        if record.get("inference_ok") is True and (score is None or not isinstance(quality_ok, bool)):
+        if record.get("inference_ok") is True and (
+            score is None or not isinstance(quality_ok, bool)
+        ):
             raise ValueError("successful inference with quality guard requires quality score and decision")
     else:
         if method is not None or score is not None or threshold is not None:
@@ -137,7 +214,9 @@ def _validate_timing_evidence(record: dict[str, Any]) -> None:
     for key in _TIMING_KEYS:
         value = record.get(key)
         if value is not None and (
-            not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0
+            not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
         ):
             raise ValueError(f"telemetry record has invalid {key}")
 
@@ -158,7 +237,9 @@ def _validate_timing_evidence(record: dict[str, Any]) -> None:
         if float(end_to_end) < inference_ms:
             raise ValueError("end-to-end latency cannot be smaller than ONNX inference latency")
         legacy = record.get("latency_ms")
-        if legacy is not None and not math.isclose(float(legacy), inference_ms, rel_tol=0.0, abs_tol=1e-12):
+        if legacy is not None and not math.isclose(
+            float(legacy), inference_ms, rel_tol=0.0, abs_tol=1e-12
+        ):
             raise ValueError("legacy latency_ms must equal onnx_inference_latency_ms")
 
 
@@ -182,7 +263,12 @@ def validate_telemetry_record(
     if not isinstance(record.get("file"), str) or not record["file"]:
         raise ValueError("telemetry record is missing file identity")
 
-    for key in ("model_sha256", "input_schema_sha256", "input_schema_file_sha256", "preprocessing_sha256"):
+    for key in (
+        "model_sha256",
+        "input_schema_sha256",
+        "input_schema_file_sha256",
+        "preprocessing_sha256",
+    ):
         if not _is_sha256(record.get(key)):
             raise ValueError(f"telemetry record has invalid {key}")
     policy_hash = record.get("policy_sha256")
