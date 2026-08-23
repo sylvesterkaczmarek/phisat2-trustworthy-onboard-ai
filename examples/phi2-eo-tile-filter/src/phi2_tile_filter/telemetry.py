@@ -69,6 +69,26 @@ def _bundle_component(bundle_dir: Path, descriptor: Any, name: str) -> Path:
     return resolved
 
 
+def _validate_runtime_validation_identity(
+    validation_path: Path,
+    *,
+    model_sha256: str,
+    policy_sha256: str,
+    input_schema_sha256: str,
+) -> None:
+    validation = _read_json_object(validation_path)
+    if validation.get("schema_version") != 3 or validation.get("split_role") != "validation":
+        raise ValueError("deployment bundle validation evidence has unsupported schema or split role")
+    if validation.get("accepted") is not True:
+        raise ValueError("deployment bundle validation evidence is not accepted")
+    if validation.get("int8_sha256") != model_sha256:
+        raise ValueError("deployment bundle validation evidence belongs to a different model")
+    if validation.get("policy_sha256") != policy_sha256:
+        raise ValueError("deployment bundle validation evidence belongs to a different policy")
+    if validation.get("input_schema_sha256") != input_schema_sha256:
+        raise ValueError("deployment bundle validation evidence belongs to a different input contract")
+
+
 def _verify_bundle_manifest_integrity(
     bundle_dir: Path,
     manifest: dict[str, Any],
@@ -114,6 +134,12 @@ def _verify_bundle_manifest_integrity(
         raise ValueError("deployment bundle manifest input-schema file hash does not match runtime schema")
     if manifest.get("validation_sha256") != sha256_file(resolved["validation"]):
         raise ValueError("deployment bundle validation hash does not match manifest")
+    _validate_runtime_validation_identity(
+        resolved["validation"],
+        model_sha256=model_sha256,
+        policy_sha256=policy_sha256,
+        input_schema_sha256=input_schema_sha256,
+    )
     return str(manifest_id)
 
 
