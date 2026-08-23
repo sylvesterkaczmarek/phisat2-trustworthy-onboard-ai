@@ -2,10 +2,34 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 from sklearn.metrics import accuracy_score, average_precision_score, precision_recall_fscore_support, roc_auc_score
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE_SRC = REPO_ROOT / "examples" / "phi2-eo-tile-filter" / "src"
+if str(EXAMPLE_SRC) not in sys.path:
+    sys.path.insert(0, str(EXAMPLE_SRC))
+
+from phi2_tile_filter.telemetry import (  # noqa: E402
+    DOWNLINK_RECORD_KIND,
+    FINAL_TEST_RECORD_KIND,
+    TELEMETRY_RECORD_SCHEMA_VERSION,
+    validate_telemetry_record,
+)
+from phi2_tile_filter.utils import sha256_file  # noqa: E402
+
+
+IDENTITY_KEYS = (
+    "deployment_bundle_id",
+    "model_sha256",
+    "policy_sha256",
+    "input_schema_sha256",
+    "input_schema_file_sha256",
+    "preprocessing_sha256",
+)
 
 
 def read_jsonl(path: str | Path) -> list[dict]:
@@ -28,6 +52,16 @@ def _one_value(records: list[dict], key: str):
     if len(values) != 1:
         raise ValueError(f"records contain inconsistent {key} values")
     return next(iter(values))
+
+
+def _records_by_file(records: list[dict], *, label: str) -> dict[str, dict]:
+    indexed: dict[str, dict] = {}
+    for record in records:
+        file_name = str(record["file"])
+        if file_name in indexed:
+            raise ValueError(f"{label} telemetry contains duplicate file record: {file_name}")
+        indexed[file_name] = record
+    return indexed
 
 
 def _calibration_metadata(calibration: dict) -> dict:
@@ -64,25 +98,92 @@ def _calibration_metadata(calibration: dict) -> dict:
     }
 
 
+def _verify_telemetry_integrity(
+    test: list[dict],
+    downlink: list[dict],
+    calibration: dict,
+    calibration_path: str | Path,
+) -> tuple[dict[str, dict], dict[str, dict], dict]:
+    # Surface a declared scientific-contract mismatch before record-version errors.
+    # Old telemetry is still rejected below when the contracts agree.
+    declared_test_schema = _one_value(test, "input_schema_sha256")
+    declared_down_schema = _one_value(downlink, "input_schema_sha256")
+    if declared_test_schema != declared_down_schema:
+        raise ValueError("final-test/downlink input schema hash mismatch")
+    if calibration.get("input_schema_sha256") != declared_test_schema:
+        raise ValueError("calibration input/preprocessing schema differs from final-test runtime")
+
+    for record in test:
+        validate_telemetry_record(
+            record,
+            expected_kind=FINAL_TEST_RECORD_KIND,
+            require_artifact_identity=True,
+        )
+    for record in downlink:
+        validate_telemetry_record(
+            record,
+            expected_kind=DOWNLINK_RECORD_KIND,
+            require_artifact_identity=True,
+        )
+
+    test_by_file = _records_by_file(test, label="final-test")
+    down_by_file = _records_by_file(downlink, label="downlink")
+    if set(test_by_file) != set(down_by_file):
+        raise ValueError("final-test and downlink logs do not cover the same files")
+
+    identity: dict[str, object] = {}
+    for key in IDENTITY_KEYS:
+        test_value = _one_value(test, key)
+        down_value = _one_value(downlink, key)
+        if test_value != down_value:
+            raise ValueError(f"final-test/downlink {key} mismatch")
+        identity[key] = test_value
+
+    test_bundle_verified = _one_value(test, "deployment_bundle_verified")
+    down_bundle_verified = _one_value(downlink, "deployment_bundle_verified")
+    if test_bundle_verified != down_bundle_verified:
+        raise ValueError("final-test/downlink bundle verification state mismatch")
+    if identity["deployment_bundle_id"] is not None and test_bundle_verified is not True:
+        raise ValueError("telemetry names a deployment bundle that was not verified")
+    identity["deployment_bundle_verified"] = bool(test_bundle_verified)
+
+    calibration_hash = sha256_file(calibration_path)
+    if identity["policy_sha256"] != calibration_hash:
+        raise ValueError("telemetry policy hash does not match the calibration policy artifact")
+    if calibration.get("model_sha256") != identity["model_sha256"]:
+        raise ValueError("calibration belongs to a different model")
+
+    for file_name in sorted(test_by_file):
+        test_record = test_by_file[file_name]
+        down_record = down_by_file[file_name]
+        if not test_record["input_observation_ok"] or not down_record["input_observation_ok"]:
+            raise ValueError(f"cannot verify input identity for {file_name}: file observation failed")
+        test_hash = test_record.get("input_sha256")
+        down_hash = down_record.get("input_sha256")
+        if test_hash != down_hash:
+            raise ValueError(f"final-test/downlink input hash mismatch for {file_name}")
+        if test_record.get("size_bytes") != down_record.get("size_bytes"):
+            raise ValueError(f"final-test/downlink input size mismatch for {file_name}")
+
+    identity["policy_artifact_sha256"] = calibration_hash
+    identity["input_hashes_verified"] = True
+    identity["telemetry_record_schema_version"] = TELEMETRY_RECORD_SCHEMA_VERSION
+    return test_by_file, down_by_file, identity
+
+
 def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: str | Path) -> dict:
     test = read_jsonl(test_log)
     downlink = read_jsonl(downlink_log)
     calibration = json.loads(Path(calibration_path).read_text(encoding="utf-8"))
     if not test or not downlink:
         raise ValueError("final-test and downlink logs must be non-empty")
-    if {r["file"] for r in test} != {r["file"] for r in downlink}:
-        raise ValueError("final-test and downlink logs do not cover the same files")
 
-    model_hash = _one_value(test, "model_sha256")
-    if _one_value(downlink, "model_sha256") != model_hash:
-        raise ValueError("final-test/downlink model hash mismatch")
-    if calibration.get("model_sha256") != model_hash:
-        raise ValueError("calibration belongs to a different model")
-    schema_hash = _one_value(test, "input_schema_sha256")
-    if _one_value(downlink, "input_schema_sha256") != schema_hash:
-        raise ValueError("final-test/downlink input schema hash mismatch")
-    if calibration.get("input_schema_sha256") != schema_hash:
-        raise ValueError("calibration input/preprocessing schema differs from final-test runtime")
+    test_by_file, down_by_file, identity = _verify_telemetry_integrity(
+        test,
+        downlink,
+        calibration,
+        calibration_path,
+    )
 
     successful = [record for record in test if record.get("inference_ok")]
     y_true = np.array([int(record["true_class"]) for record in successful], dtype=int)
@@ -99,12 +200,12 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
         auc = None
         pr_auc = None
 
-    down_by_file = {record["file"]: record for record in downlink}
     event_records = [record for record in test if int(record["true_class"]) == 1]
     background_records = [record for record in test if int(record["true_class"]) == 0]
-    event_kept = sum(bool(down_by_file[record["file"]]["kept"]) for record in event_records)
+    event_kept = sum(bool(down_by_file[record["file"]]["retained_for_downlink"]) for record in event_records)
     background_discarded = sum(
-        not bool(down_by_file[record["file"]]["kept"]) for record in background_records
+        not bool(down_by_file[record["file"]]["retained_for_downlink"])
+        for record in background_records
     )
     event_retention_recall = event_kept / len(event_records) if event_records else 0.0
     background_rejection_rate = (
@@ -112,18 +213,29 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
     )
 
     total_bytes = sum(int(record["size_bytes"]) for record in downlink)
-    kept_bytes = sum(int(record["size_bytes"]) for record in downlink if record["kept"])
+    kept_bytes = sum(
+        int(record["size_bytes"])
+        for record in downlink
+        if record["retained_for_downlink"]
+    )
     latencies = [
         float(record["latency_ms"])
         for record in successful
         if record.get("latency_ms") is not None
     ]
+    materialization_failures = sum(
+        bool(record["retention_requested"]) and not bool(record["retained_for_downlink"])
+        for record in downlink
+    )
 
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "split_role": "final_test",
-        "model_sha256": model_hash,
-        "input_schema_sha256": schema_hash,
+        "deployment_bundle_id": identity["deployment_bundle_id"],
+        "model_sha256": identity["model_sha256"],
+        "policy_sha256": identity["policy_sha256"],
+        "input_schema_sha256": identity["input_schema_sha256"],
+        "telemetry_integrity": identity,
         "final_test_sample_counts": {
             "samples_total": len(test),
             "event_samples": len(event_records),
@@ -145,11 +257,12 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
         "final_test_downlink_retention_metrics": {
             "event_retention_recall": float(event_retention_recall),
             "background_rejection_rate": float(background_rejection_rate),
-            "tiles_kept": sum(bool(record["kept"]) for record in downlink),
+            "tiles_kept": sum(bool(record["retained_for_downlink"]) for record in downlink),
             "tiles_total": len(downlink),
             "fallback_tiles": sum(
                 str(record["decision"]).endswith("fallback") for record in downlink
             ),
+            "downlink_materialization_failures": int(materialization_failures),
             "bytes_total": total_bytes,
             "bytes_kept": kept_bytes,
             "downlink_bytes_saved_pct": (
