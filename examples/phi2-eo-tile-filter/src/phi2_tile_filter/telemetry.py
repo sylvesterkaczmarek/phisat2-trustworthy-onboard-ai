@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import string
 from pathlib import Path
 from typing import Any
 
 from .utils import sha256_file
 
-TELEMETRY_RECORD_SCHEMA_VERSION = 4
+TELEMETRY_RECORD_SCHEMA_VERSION = 5
 FINAL_TEST_RECORD_KIND = "final_test_inference"
 DOWNLINK_RECORD_KIND = "downlink_decision"
 
@@ -94,6 +95,37 @@ def resolve_artifact_identity(
     }
 
 
+def _validate_quality_evidence(record: dict[str, Any]) -> None:
+    enabled = record.get("input_quality_guard_enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("telemetry record is missing input quality guard state")
+    method = record.get("input_quality_method")
+    score = record.get("input_quality_score")
+    threshold = record.get("input_quality_threshold")
+    quality_ok = record.get("input_quality_ok")
+
+    if enabled:
+        if not isinstance(method, str) or not method:
+            raise ValueError("enabled input quality guard requires a method")
+        if not isinstance(threshold, (int, float)) or not math.isfinite(float(threshold)) or float(threshold) < 0.0:
+            raise ValueError("enabled input quality guard requires a finite non-negative threshold")
+        if score is not None and (
+            not isinstance(score, (int, float)) or not math.isfinite(float(score)) or float(score) < 0.0
+        ):
+            raise ValueError("input quality score must be null or finite and non-negative")
+        if quality_ok is not None and not isinstance(quality_ok, bool):
+            raise ValueError("input_quality_ok must be null or boolean")
+        if record.get("inference_ok") is True and (score is None or not isinstance(quality_ok, bool)):
+            raise ValueError("successful inference with quality guard requires quality score and decision")
+    else:
+        if method is not None or score is not None or threshold is not None:
+            raise ValueError("disabled input quality guard must not emit guard metrics")
+        if record.get("inference_ok") is True and quality_ok is not True:
+            raise ValueError("successful inference without quality guard must mark input_quality_ok true")
+        if quality_ok not in (None, True):
+            raise ValueError("disabled input quality guard has invalid input_quality_ok state")
+
+
 def validate_telemetry_record(
     record: dict[str, Any],
     *,
@@ -136,6 +168,7 @@ def validate_telemetry_record(
         raise ValueError("telemetry record is missing retention request")
     if not isinstance(record.get("decision"), str) or not record["decision"]:
         raise ValueError("telemetry record is missing decision")
+    _validate_quality_evidence(record)
 
     input_hash = record.get("input_sha256")
     size_bytes = record.get("size_bytes")
