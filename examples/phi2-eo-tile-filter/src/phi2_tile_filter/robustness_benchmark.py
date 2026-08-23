@@ -17,9 +17,18 @@ from .filesystem import (
 from .input_schema import input_schema_sha256, read_input_schema, write_input_schema
 from .synth import make_tile
 from .telemetry import DOWNLINK_RECORD_KIND, validate_telemetry_record
+from .utils import sha256_file
 
 BENCHMARK_SCHEMA_VERSION = 1
 CATEGORIES = ("nominal", "degraded", "corrupted", "ood")
+IDENTITY_KEYS = (
+    "deployment_bundle_id",
+    "model_sha256",
+    "policy_sha256",
+    "input_schema_sha256",
+    "input_schema_file_sha256",
+    "preprocessing_sha256",
+)
 
 
 def _clip(array: np.ndarray) -> np.ndarray:
@@ -92,8 +101,18 @@ def _degraded(
         array += brightness_shift
         perturbations = ["sensor_noise", "brightness_illumination_shift"]
     elif recipe == 1:
-        gains = np.linspace(1.0 - band_gain_drift, 1.0 + band_gain_drift, array.shape[2], dtype=np.float32)
-        offsets = np.linspace(-band_offset_drift, band_offset_drift, array.shape[2], dtype=np.float32)
+        gains = np.linspace(
+            1.0 - band_gain_drift,
+            1.0 + band_gain_drift,
+            array.shape[2],
+            dtype=np.float32,
+        )
+        offsets = np.linspace(
+            -band_offset_drift,
+            band_offset_drift,
+            array.shape[2],
+            dtype=np.float32,
+        )
         array = array * gains[None, None, :] + offsets[None, None, :]
         spectral = np.linspace(0.72, 1.28, array.shape[2], dtype=np.float32)
         array *= spectral[None, None, :]
@@ -159,10 +178,15 @@ def _ood_pattern(
         checker = ((xx // max(1, size // 8) + yy // max(1, size // 8)) % 2).astype(np.float32)
         spectrum = np.linspace(0.15, 0.95, bands, dtype=np.float32)
         array = checker[..., None] * spectrum[None, None, :]
-        return array.astype(np.float32), ["unknown_checkerboard_background", "spectral_distribution_shift"]
+        return array.astype(np.float32), [
+            "unknown_checkerboard_background",
+            "spectral_distribution_shift",
+        ]
     if recipe == 1:
         phase = float(rng.uniform(0.0, 2.0 * np.pi))
-        wave = 0.5 + 0.45 * np.sin((xx + 1.7 * yy) * (2.0 * np.pi / max(4, size // 3)) + phase)
+        wave = 0.5 + 0.45 * np.sin(
+            (xx + 1.7 * yy) * (2.0 * np.pi / max(4, size // 3)) + phase
+        )
         spectrum = np.linspace(1.0, 0.35, bands, dtype=np.float32)
         array = wave[..., None] * spectrum[None, None, :]
         return _clip(array), ["unknown_sinusoidal_background", "spectral_distribution_shift"]
@@ -176,7 +200,11 @@ def _ood_pattern(
         return _clip(array), ["unknown_radial_background", "spectral_distribution_shift"]
     stripes = ((xx // max(1, size // 10)) % 3).astype(np.float32) / 2.0
     spectrum = np.roll(np.linspace(0.1, 0.95, bands, dtype=np.float32), 1)
-    array = np.clip(0.15 + 0.8 * stripes[..., None] * spectrum[None, None, :], 0.0, 1.0)
+    array = np.clip(
+        0.15 + 0.8 * stripes[..., None] * spectrum[None, None, :],
+        0.0,
+        1.0,
+    )
     return array.astype(np.float32), ["unknown_striped_background", "spectral_distribution_shift"]
 
 
@@ -196,7 +224,12 @@ def generate_benchmark(
 ) -> dict[str, Any]:
     if samples_per_category < 4:
         raise ValueError("samples_per_category must be at least 4")
-    if noise_std < 0.0 or brightness_shift < 0.0 or band_gain_drift < 0.0 or band_offset_drift < 0.0:
+    if (
+        noise_std < 0.0
+        or brightness_shift < 0.0
+        or band_gain_drift < 0.0
+        or band_offset_drift < 0.0
+    ):
         raise ValueError("perturbation magnitudes must be non-negative")
     if not 0.0 <= cloud_opacity <= 1.0:
         raise ValueError("cloud_opacity must be in [0, 1]")
@@ -206,7 +239,11 @@ def generate_benchmark(
     schema = read_input_schema(input_schema_path)
     tensor = schema["tensor"]
     source = schema["source"]
-    if tensor["source_layout"] != "HWC" or source["format"] != "npy" or source["dtype"] != "float32":
+    if (
+        tensor["source_layout"] != "HWC"
+        or source["format"] != "npy"
+        or source["dtype"] != "float32"
+    ):
         raise ValueError("robustness benchmark currently requires float32 HWC NumPy input")
     size = int(tensor["height"])
     if int(tensor["width"]) != size:
@@ -233,7 +270,12 @@ def generate_benchmark(
             rng = np.random.default_rng(category_seed)
             for index in range(samples_per_category):
                 if category == "ood":
-                    tile, perturbations = _ood_pattern(rng, size=size, bands=bands, index=index)
+                    tile, perturbations = _ood_pattern(
+                        rng,
+                        size=size,
+                        bands=bands,
+                        index=index,
+                    )
                     true_class = None
                     class_name = "unknown"
                 else:
@@ -337,43 +379,67 @@ def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
+def _one_value(records: list[dict[str, Any]], key: str) -> Any:
+    values = {record.get(key) for record in records}
+    if len(values) != 1:
+        raise ValueError(f"benchmark telemetry contains inconsistent {key} values")
+    return next(iter(values))
+
+
 def _fraction(numerator: int | float, denominator: int | float) -> float | None:
     if denominator == 0:
         return None
     return float(numerator / denominator)
 
 
-def _category_metrics(samples: list[dict[str, Any]], telemetry: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _category_metrics(
+    samples: list[dict[str, Any]],
+    telemetry: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
     records = [(sample, telemetry[str(sample["file"])]) for sample in samples]
     event = [(sample, record) for sample, record in records if sample.get("true_class") == 1]
-    background = [(sample, record) for sample, record in records if sample.get("true_class") == 0]
-    unknown = [(sample, record) for sample, record in records if sample.get("true_class") is None]
+    background = [
+        (sample, record) for sample, record in records if sample.get("true_class") == 0
+    ]
+    unknown = [
+        (sample, record) for sample, record in records if sample.get("true_class") is None
+    ]
     retained = sum(bool(record["retained_for_downlink"]) for _, record in records)
     fallbacks = sum(str(record["decision"]).endswith("fallback") for _, record in records)
     guard_triggers = sum(
-        record.get("input_quality_guard_enabled") is True and record.get("input_quality_ok") is False
+        record.get("input_quality_guard_enabled") is True
+        and record.get("input_quality_ok") is False
         for _, record in records
     )
     inference_failures = sum(not bool(record["inference_ok"]) for _, record in records)
     outside_detection = sum(
-        (record.get("input_quality_guard_enabled") is True and record.get("input_quality_ok") is False)
+        (
+            record.get("input_quality_guard_enabled") is True
+            and record.get("input_quality_ok") is False
+        )
         or not bool(record["inference_ok"])
         for _, record in records
     )
-    source_total = sum(int(record["size_bytes"]) for _, record in records if isinstance(record.get("size_bytes"), int))
+    source_total = sum(
+        int(record["size_bytes"])
+        for _, record in records
+        if isinstance(record.get("size_bytes"), int)
+    )
     source_retained = sum(
         int(record["size_bytes"])
         for _, record in records
         if record["retained_for_downlink"] and isinstance(record.get("size_bytes"), int)
     )
     event_retained = sum(bool(record["retained_for_downlink"]) for _, record in event)
-    background_rejected = sum(not bool(record["retained_for_downlink"]) for _, record in background)
+    background_rejected = sum(
+        not bool(record["retained_for_downlink"]) for _, record in background
+    )
     quality_scores = [
         float(record["input_quality_score"])
         for _, record in records
         if record.get("input_quality_score") is not None
     ]
-    result: dict[str, Any] = {
+    return {
         "samples": len(records),
         "event_samples": len(event),
         "background_samples": len(background),
@@ -393,7 +459,6 @@ def _category_metrics(samples: list[dict[str, Any]], telemetry: dict[str, dict[s
         "input_quality_score_median": float(np.median(quality_scores)) if quality_scores else None,
         "input_quality_score_max": float(np.max(quality_scores)) if quality_scores else None,
     }
-    return result
 
 
 def _prevalence_scenarios(
@@ -449,24 +514,62 @@ def summarize_benchmark(
     *,
     event_prevalences: Iterable[float] = (0.01, 0.05, 0.10),
 ) -> dict[str, Any]:
-    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    manifest_path = Path(manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or manifest.get("schema_version") != BENCHMARK_SCHEMA_VERSION:
         raise ValueError("unsupported robustness benchmark manifest")
     samples = manifest.get("samples")
     if not isinstance(samples, list) or not samples:
         raise ValueError("robustness benchmark manifest has no samples")
 
+    manifest_names = [str(sample.get("file")) for sample in samples]
+    if len(manifest_names) != len(set(manifest_names)):
+        raise ValueError("robustness benchmark manifest contains duplicate file entries")
+
+    schema_path = manifest_path.parent / "input_schema.json"
+    schema_hash = input_schema_sha256(read_input_schema(schema_path))
+    if manifest.get("input_schema_sha256") != schema_hash:
+        raise ValueError("robustness benchmark manifest input schema hash is inconsistent")
+
     telemetry_records = _read_jsonl(telemetry_log)
+    if not telemetry_records:
+        raise ValueError("robustness benchmark telemetry is empty")
     telemetry: dict[str, dict[str, Any]] = {}
     for record in telemetry_records:
-        validate_telemetry_record(record, expected_kind=DOWNLINK_RECORD_KIND, require_artifact_identity=True)
+        validate_telemetry_record(
+            record,
+            expected_kind=DOWNLINK_RECORD_KIND,
+            require_artifact_identity=True,
+        )
         file_name = str(record["file"])
         if file_name in telemetry:
             raise ValueError(f"duplicate benchmark telemetry record: {file_name}")
         telemetry[file_name] = record
-    manifest_files = {str(sample["file"]) for sample in samples}
+    manifest_files = set(manifest_names)
     if manifest_files != set(telemetry):
         raise ValueError("benchmark manifest and telemetry do not cover the same files")
+
+    identity = {key: _one_value(telemetry_records, key) for key in IDENTITY_KEYS}
+    record_schema_version = _one_value(telemetry_records, "schema_version")
+    bundle_verified = _one_value(telemetry_records, "deployment_bundle_verified")
+    quality_guard_enabled = _one_value(telemetry_records, "input_quality_guard_enabled")
+    if identity["input_schema_sha256"] != schema_hash:
+        raise ValueError("benchmark telemetry input schema does not match benchmark manifest")
+    if identity["deployment_bundle_id"] is not None and bundle_verified is not True:
+        raise ValueError("benchmark telemetry names a deployment bundle that was not verified")
+
+    for sample in samples:
+        file_name = str(sample["file"])
+        record = telemetry[file_name]
+        source = manifest_path.parent / file_name
+        if not source.is_file():
+            raise FileNotFoundError(f"benchmark source file is missing: {source}")
+        if record.get("input_observation_ok") is not True:
+            raise ValueError(f"cannot verify benchmark source identity for {file_name}")
+        if record.get("input_sha256") != sha256_file(source):
+            raise ValueError(f"benchmark source hash differs from telemetry for {file_name}")
+        if record.get("size_bytes") != source.stat().st_size:
+            raise ValueError(f"benchmark source size differs from telemetry for {file_name}")
 
     grouped: dict[str, list[dict[str, Any]]] = {category: [] for category in CATEGORIES}
     for sample in samples:
@@ -479,30 +582,36 @@ def summarize_benchmark(
         category: _category_metrics(grouped[category], telemetry)
         for category in CATEGORIES
     }
-    category_metrics["nominal"]["nominal_false_positive_detection_rate"] = category_metrics["nominal"][
-        "quality_or_preprocessing_detection_rate"
-    ]
+    category_metrics["nominal"]["nominal_false_positive_detection_rate"] = category_metrics[
+        "nominal"
+    ]["quality_or_preprocessing_detection_rate"]
     category_metrics["degraded"]["degradation_detection_rate"] = category_metrics["degraded"][
         "quality_or_preprocessing_detection_rate"
     ]
-    category_metrics["corrupted"]["degradation_detection_rate"] = category_metrics["corrupted"][
-        "quality_or_preprocessing_detection_rate"
-    ]
+    category_metrics["corrupted"]["degradation_detection_rate"] = category_metrics[
+        "corrupted"
+    ]["quality_or_preprocessing_detection_rate"]
     category_metrics["ood"]["ood_detection_rate"] = category_metrics["ood"][
         "quality_or_preprocessing_detection_rate"
     ]
 
-    first = telemetry_records[0]
     return {
         "schema_version": 1,
         "benchmark_name": manifest["benchmark_name"],
         "simulation_only": True,
         "physical_sensor_fidelity_claimed": False,
-        "deployment_bundle_id": first.get("deployment_bundle_id"),
-        "model_sha256": first.get("model_sha256"),
-        "policy_sha256": first.get("policy_sha256"),
-        "input_schema_sha256": first.get("input_schema_sha256"),
-        "input_quality_guard_enabled": bool(first.get("input_quality_guard_enabled")),
+        "deployment_bundle_id": identity["deployment_bundle_id"],
+        "model_sha256": identity["model_sha256"],
+        "policy_sha256": identity["policy_sha256"],
+        "input_schema_sha256": identity["input_schema_sha256"],
+        "input_quality_guard_enabled": bool(quality_guard_enabled),
+        "telemetry_integrity": {
+            **identity,
+            "deployment_bundle_verified": bool(bundle_verified),
+            "telemetry_record_schema_version": record_schema_version,
+            "benchmark_manifest_schema_verified": True,
+            "benchmark_input_hashes_verified": True,
+        },
         "categories": category_metrics,
         "prevalence_simulation": {
             "basis": "nominal_id_class_conditional_source_byte_retention",
@@ -529,7 +638,9 @@ def _parse_prevalences(text: str) -> tuple[float, ...]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate or summarize the deterministic EO robustness benchmark.")
+    parser = argparse.ArgumentParser(
+        description="Generate or summarize the deterministic EO robustness benchmark."
+    )
     sub = parser.add_subparsers(dest="action", required=True)
 
     generate = sub.add_parser("generate")
