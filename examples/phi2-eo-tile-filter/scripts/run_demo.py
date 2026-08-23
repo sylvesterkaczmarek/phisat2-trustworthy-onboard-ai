@@ -24,6 +24,10 @@ def main() -> None:
 
     example_root = Path(__file__).resolve().parents[1]
     repo_root = example_root.parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from assurance.model_store import resolve_bundle
+
     output_root = args.output_root.resolve()
     tiles = output_root / "tiles"
     runs = output_root / "runs"
@@ -32,6 +36,9 @@ def main() -> None:
     reports = output_root / "reports"
     downlink = output_root / "downlink"
     calibration = output_root / "calibration.json"
+    candidate_bundle = models / "candidate_bundle"
+    bundle_store = models / "bundles"
+    deployment_state = models / "deployment_state.json"
     python = sys.executable
 
     run(
@@ -118,26 +125,10 @@ def main() -> None:
     run(
         [
             python,
-            str(repo_root / "assurance" / "model_store.py"),
-            "promote",
-            "--candidate",
-            str(models / "tinycnn_int8.onnx"),
-            "--active",
-            str(models / "active.onnx"),
-            "--previous",
-            str(models / "previous.onnx"),
-            "--manifest",
-            str(models / "model_state.json"),
-        ],
-        cwd=repo_root,
-    )
-    run(
-        [
-            python,
             "-m",
             "phi2_tile_filter.calibrate_threshold",
             "--onnx",
-            str(models / "active.onnx"),
+            str(models / "tinycnn_int8.onnx"),
             "--data",
             str(tiles / "calib"),
             "--target-recall",
@@ -152,13 +143,48 @@ def main() -> None:
     run(
         [
             python,
+            str(repo_root / "assurance" / "model_store.py"),
+            "build",
+            "--model",
+            str(models / "tinycnn_int8.onnx"),
+            "--policy",
+            str(calibration),
+            "--validation",
+            str(reports / "model_validation.json"),
+            "--out",
+            str(candidate_bundle),
+        ],
+        cwd=repo_root,
+    )
+    run(
+        [
+            python,
+            str(repo_root / "assurance" / "model_store.py"),
+            "promote",
+            "--candidate-bundle",
+            str(candidate_bundle),
+            "--store",
+            str(bundle_store),
+            "--state",
+            str(deployment_state),
+        ],
+        cwd=repo_root,
+    )
+
+    active = resolve_bundle(bundle_store, deployment_state, slot="active")
+    active_model = Path(active["model"])
+    active_policy = Path(active["policy"])
+
+    run(
+        [
+            python,
             str(repo_root / "assurance" / "telemetry_log.py"),
             "--onnx",
-            str(models / "active.onnx"),
+            str(active_model),
             "--data",
             str(tiles / "test"),
             "--policy",
-            str(calibration),
+            str(active_policy),
             "--out",
             str(logs / "test.jsonl"),
         ],
@@ -170,11 +196,11 @@ def main() -> None:
             "-m",
             "phi2_tile_filter.bandwidth_filter",
             "--onnx",
-            str(models / "active.onnx"),
+            str(active_model),
             "--data",
             str(tiles / "test"),
             "--policy",
-            str(calibration),
+            str(active_policy),
             "--downlink-out",
             str(downlink),
             "--log",
@@ -191,7 +217,7 @@ def main() -> None:
             "--downlink-log",
             str(logs / "downlink.jsonl"),
             "--calib",
-            str(calibration),
+            str(active_policy),
             "--out-dir",
             str(reports),
         ],
@@ -199,6 +225,7 @@ def main() -> None:
     )
 
     metrics = json.loads((reports / "metrics.json").read_text(encoding="utf-8"))
+    metrics["active_bundle_id"] = active["bundle_id"]
     print(json.dumps(metrics, indent=2, sort_keys=True))
 
 

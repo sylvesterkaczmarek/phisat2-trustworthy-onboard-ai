@@ -67,6 +67,7 @@ def validate_models(
         raise RuntimeError(f"INT8 accuracy drop {drop:.4f} exceeds {max_accuracy_drop:.4f}")
     if agreement < min_argmax_agreement:
         raise RuntimeError(f"FP32/INT8 agreement {agreement:.4f} is below {min_argmax_agreement:.4f}")
+    result["accepted"] = True
     return result
 
 

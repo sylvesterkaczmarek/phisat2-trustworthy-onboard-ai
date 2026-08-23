@@ -17,6 +17,8 @@ examples/phi2-eo-tile-filter/downlink/
 examples/phi2-eo-tile-filter/models/*.onnx
 examples/phi2-eo-tile-filter/models/*.json
 examples/phi2-eo-tile-filter/models/*.bak
+examples/phi2-eo-tile-filter/models/candidate_bundle/
+examples/phi2-eo-tile-filter/models/bundles/
 examples/phi2-eo-tile-filter/*.json
 *.pt
 
