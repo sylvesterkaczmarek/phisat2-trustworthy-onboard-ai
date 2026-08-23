@@ -16,6 +16,7 @@ from phi2_tile_filter.filesystem import assert_paths_disjoint, staged_text_file 
 from phi2_tile_filter.runtime import OnnxRunner  # noqa: E402
 from phi2_tile_filter.telemetry import (  # noqa: E402
     FINAL_TEST_RECORD_KIND,
+    TELEMETRY_RECORD_SCHEMA_VERSION,
     resolve_artifact_identity,
     validate_telemetry_record,
 )
@@ -53,6 +54,7 @@ def emit_telemetry(
         raise ValueError("resolved policy identity changed while loading policy")
 
     failures = 0
+    quality_fallbacks = 0
     with staged_text_file(output) as handle:
         for path, true_class in items:
             record = runner.evaluate_file(
@@ -68,6 +70,8 @@ def emit_telemetry(
             record["true_class_name"] = CLASS_NAMES[true_class]
             if not record["inference_ok"]:
                 failures += 1
+            if record["decision"] == "input_quality_fallback":
+                quality_fallbacks += 1
             validate_telemetry_record(
                 record,
                 expected_kind=FINAL_TEST_RECORD_KIND,
@@ -76,10 +80,12 @@ def emit_telemetry(
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
     result = {
-        "schema_version": 4,
-        "record_schema_version": 4,
+        "schema_version": 5,
+        "record_schema_version": TELEMETRY_RECORD_SCHEMA_VERSION,
         "samples": len(items),
         "inference_failures": failures,
+        "input_quality_guard_enabled": policy.input_quality_guard is not None,
+        "input_quality_fallbacks": quality_fallbacks,
         "deployment_bundle_id": identity["deployment_bundle_id"],
         "deployment_bundle_verified": identity["deployment_bundle_verified"],
         "model_sha256": runner.model_sha256,
