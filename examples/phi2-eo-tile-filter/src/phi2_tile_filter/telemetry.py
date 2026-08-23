@@ -36,7 +36,6 @@ def resolve_artifact_identity(
     preprocessing_sha256: str,
     explicit_bundle_id: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve and, where possible, verify deployment artifact identity."""
     model = Path(model_path).resolve(strict=False)
     policy = Path(policy_path).resolve(strict=False)
     schema = Path(input_schema_path).resolve(strict=False)
@@ -57,7 +56,6 @@ def resolve_artifact_identity(
         if bundle_id is not None and bundle_id != manifest_id:
             raise ValueError("explicit deployment bundle id does not match bundle manifest")
         bundle_id = str(manifest_id)
-
         if manifest.get("model_sha256") != model_sha256:
             raise ValueError("deployment bundle manifest model hash does not match runtime model")
         if manifest.get("policy_sha256") != policy_sha:
@@ -66,15 +64,10 @@ def resolve_artifact_identity(
             raise ValueError("deployment bundle manifest input contract does not match runtime schema")
         if manifest.get("input_schema_file_sha256") != schema_file_sha:
             raise ValueError("deployment bundle manifest input-schema file hash does not match runtime schema")
-
         components = manifest.get("components")
         if not isinstance(components, dict):
             raise ValueError("deployment bundle manifest is missing component descriptors")
-        expected_paths = {
-            "model": model,
-            "policy": policy,
-            "input_schema": schema,
-        }
+        expected_paths = {"model": model, "policy": policy, "input_schema": schema}
         for name, actual in expected_paths.items():
             descriptor = components.get(name)
             if not isinstance(descriptor, dict) or not isinstance(descriptor.get("path"), str):
@@ -103,7 +96,6 @@ def _validate_quality_evidence(record: dict[str, Any]) -> None:
     score = record.get("input_quality_score")
     threshold = record.get("input_quality_threshold")
     quality_ok = record.get("input_quality_ok")
-
     if enabled:
         if not isinstance(method, str) or not method:
             raise ValueError("enabled input quality guard requires a method")
@@ -132,43 +124,40 @@ def validate_telemetry_record(
     expected_kind: str | None = None,
     require_artifact_identity: bool = True,
 ) -> dict[str, Any]:
-    """Validate one runtime/downlink telemetry record before persistence or reporting."""
     if not isinstance(record, dict):
         raise ValueError("telemetry record must be an object")
-    if record.get("schema_version") != TELEMETRY_RECORD_SCHEMA_VERSION:
+    schema_version = record.get("schema_version")
+    if schema_version not in (4, TELEMETRY_RECORD_SCHEMA_VERSION):
         raise ValueError("unsupported telemetry record schema version")
     kind = record.get("record_kind")
     if kind not in {FINAL_TEST_RECORD_KIND, DOWNLINK_RECORD_KIND}:
         raise ValueError("unsupported telemetry record kind")
     if expected_kind is not None and kind != expected_kind:
         raise ValueError(f"expected telemetry record kind {expected_kind}, found {kind}")
-
     if not isinstance(record.get("file"), str) or not record["file"]:
         raise ValueError("telemetry record is missing file identity")
 
     for key in ("model_sha256", "input_schema_sha256", "input_schema_file_sha256", "preprocessing_sha256"):
         if not _is_sha256(record.get(key)):
             raise ValueError(f"telemetry record has invalid {key}")
-
     policy_hash = record.get("policy_sha256")
     if require_artifact_identity and not _is_sha256(policy_hash):
         raise ValueError("telemetry record has invalid policy_sha256")
     if policy_hash is not None and not _is_sha256(policy_hash):
         raise ValueError("telemetry record has invalid policy_sha256")
-
     bundle_id = record.get("deployment_bundle_id")
     if bundle_id is not None and not _is_sha256(bundle_id):
         raise ValueError("telemetry record has invalid deployment_bundle_id")
     if not isinstance(record.get("deployment_bundle_verified"), bool):
         raise ValueError("telemetry record is missing deployment bundle verification state")
-
     if not isinstance(record.get("inference_ok"), bool):
         raise ValueError("telemetry record is missing inference status")
     if not isinstance(record.get("retention_requested"), bool):
         raise ValueError("telemetry record is missing retention request")
     if not isinstance(record.get("decision"), str) or not record["decision"]:
         raise ValueError("telemetry record is missing decision")
-    _validate_quality_evidence(record)
+    if schema_version == TELEMETRY_RECORD_SCHEMA_VERSION:
+        _validate_quality_evidence(record)
 
     input_hash = record.get("input_sha256")
     size_bytes = record.get("size_bytes")
@@ -199,5 +188,4 @@ def validate_telemetry_record(
             raise ValueError("downlink_error must be null or a string")
         if record["retained_for_downlink"] and not record["retention_requested"]:
             raise ValueError("downlink record cannot retain data that the policy did not request")
-
     return record
