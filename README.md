@@ -8,7 +8,7 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17567181.svg)](https://doi.org/10.5281/zenodo.17567181)
 
-Research demonstrator for deterministic Earth-observation tile triage, PyTorch to ONNX deployment, static INT8 quantization, conservative downlink fallback, telemetry, and coherent model-policy-preprocessing deployment rollback. The workflow is inspired by onboard EO processing such as PhiSat-2, but it is independent software and is not ESA or PhiSat-2 flight code.
+Research demonstrator for deterministic Earth-observation tile triage, PyTorch to ONNX deployment, static INT8 quantization, conservative downlink fallback, deployment-bound telemetry, and coherent model-policy-preprocessing rollback. The workflow is inspired by onboard EO processing such as PhiSat-2, but it is independent software and is not ESA or PhiSat-2 flight code.
 
 ## At a glance
 
@@ -27,9 +27,10 @@ flowchart LR
     F --> K
     G --> K
     K --> L[Atomic active bundle pointer]
-    T[Final test split] --> H[Final downlink evaluation]
+    T[Final test split] --> H[Structured runtime telemetry]
     L --> H
-    H --> J[Telemetry and final report]
+    H --> I[Staged downlink materialisation]
+    I --> J[Identity reconciliation + final report]
 ```
 
 The design uses four independent data roles and a versioned input/preprocessing contract. A deployable configuration is an immutable bundle that cryptographically binds the ONNX model to its band ordering, preprocessing schema, calibration policy, and validation evidence.
@@ -46,16 +47,22 @@ The design uses four independent data roles and a versioned input/preprocessing 
 - validation-only FP32 versus INT8 gates for accuracy, event recall/FNR, F1, PR-AUC, score drift, argmax agreement, and calibrated retain/discard decisions
 - calibrated event threshold with empirical recall and a one-sided exact Clopper-Pearson lower confidence bound
 - optional acceptance gate on the calibration recall lower bound
-- conservative fallback that downlinks low-confidence tiles and inference failures
+- conservative structured fallback for stat, hashing, preprocessing, inference, and decision failures
+- deployment-bound telemetry carrying bundle, model, policy, preprocessing-schema, and per-input hashes
+- per-file verification that retained downlink copies match the input hash observed during evaluation
 - strict channel handling with no implicit grayscale replication, alpha addition, or channel dropping
 - deterministic rejection of ambiguous legacy CHW/HWC NumPy layouts
 - deliberate rejection of TIFF/GeoTIFF by the generic loader rather than unsafe 8-bit conversion
+- staged and guarded replacement of synthetic-data and downlink output trees
+- watchdog timeout, optional heartbeat timeout, terminate/kill escalation, and structured restart telemetry
 - content-addressed immutable deployment bundles with coherent rollback
 - CI that runs the full multispectral pipeline
 
 ## Decision policy
 
-A tile is retained when it is predicted to contain the target event, when confidence is below the configured minimum, or when preprocessing/inference fails. Only confidently classified background data are discarded.
+A tile is requested for retention when it is predicted to contain the target event, when confidence is below the configured minimum, or when input observation, preprocessing, or inference fails. Only confidently classified background data are intentionally discarded.
+
+The downlink log separately records whether a requested retention was actually materialised. A disappearing or unreadable source can therefore trigger the correct conservative policy decision without being falsely counted as successfully retained science data.
 
 See [docs/assurance.md](docs/assurance.md) for the assurance model and limitations.
 
@@ -112,6 +119,7 @@ The pipeline fails rather than silently continuing when:
 - validation-split INT8 accuracy, event recall/FNR, PR-AUC, score drift, or calibrated retention behaviour regresses beyond configured limits
 - an optional calibration recall lower-bound requirement is not met
 - any bundle component or semantic input-contract binding is inconsistent
+- final-test and downlink telemetry disagree on bundle, model, policy, preprocessing, file set, per-file input hash, or observed file size
 
 The final test split is not used to decide whether the candidate is accepted.
 
@@ -138,6 +146,20 @@ PNG and JPEG are handled only with their existing `L`, `RGB`, or `RGBA` channel 
 
 See [examples/phi2-eo-tile-filter/data/README.md](examples/phi2-eo-tile-filter/data/README.md) for a seven-band schema example.
 
+## Telemetry integrity
+
+Runtime JSONL records use an explicit schema version and include the deployment bundle ID, model SHA-256, calibration-policy file SHA-256, semantic input-contract hash, exact schema-file SHA-256, preprocessing fingerprint, and per-input SHA-256.
+
+The final summarizer validates each record before using it. It rejects duplicate file entries and requires the final-test and downlink logs to describe the same files and identities. It also hashes the supplied calibration policy and verifies that it is the exact policy named in both logs. A final report is refused when an input could not be stably hashed or when the two passes observed different bytes.
+
+This is integrity checking for the demonstrator, not authenticated or tamper-evident telemetry. Signed records or an authenticated transport would be needed for adversarial telemetry integrity.
+
+## Filesystem safety
+
+Synthetic dataset replacement and downlink materialisation use sibling staging directories. Existing output is not recursively removed before new work succeeds.
+
+Recursive replacement refuses the filesystem root, home directory, current working directory, and the system temporary-directory root. Input and output trees must be disjoint, so equal paths and ancestor/descendant configurations are rejected. The downlink log must also sit outside both the input and output trees.
+
 ## Deployment bundle handling
 
 Build a candidate only after calibration and validation have succeeded:
@@ -163,6 +185,30 @@ python ../../assurance/model_store.py promote \
 bash ../../assurance/rollback.sh
 ```
 
+## Watchdog
+
+The watchdog can restart a non-zero child process and can also stop a hung process after a configured wall-clock timeout:
+
+```bash
+python ../../assurance/watchdog.py \
+  --restarts 3 \
+  --timeout-s 30 \
+  --terminate-grace-s 2 \
+  --log logs/watchdog.jsonl \
+  -- python -m phi2_tile_filter.infer_onnx --onnx /path/to/model.onnx --data tiles/test
+```
+
+An optional heartbeat file can detect a process that remains alive but stops making progress:
+
+```bash
+python ../../assurance/watchdog.py \
+  --heartbeat-file /tmp/inference.heartbeat \
+  --heartbeat-timeout-s 10 \
+  -- python your_wrapper_that_updates_the_heartbeat.py
+```
+
+On timeout the watchdog requests termination first and escalates to a kill only if the grace interval expires. Attempt telemetry records the outcome, return code, termination action, heartbeat updates, and restart reason. This is a process-level research pattern rather than flight FDIR.
+
 ## Reproducibility
 
 See [docs/reproducibility.md](docs/reproducibility.md). Training seeds Python, NumPy, PyTorch, and DataLoader shuffling. The dataset manifest records all four split roles, independent RNG child streams, and the input-contract hash.
@@ -171,7 +217,7 @@ See [docs/reproducibility.md](docs/reproducibility.md). Training seeds Python, N
 
 This repository is a software and assurance demonstrator. The synthetic benchmark is deliberately simple. Input-contract hashes prove consistency between declared metadata; they do not prove that an upstream producer labelled raw sensor arrays correctly. The generic seven-band schema does not reproduce PhiSat-2 bands or radiometry.
 
-The repository does not establish flight readiness, radiation tolerance, worst-case execution time, hardware qualification, operational EO accuracy, formal safety, or mission-level fault tolerance. Real deployment would require representative sensor data, trusted provenance, sensor-specific radiometric ingestion, hardware-in-the-loop validation, resource and thermal limits, signed update handling, fault injection, and mission-specific acceptance criteria.
+The repository does not establish flight readiness, radiation tolerance, worst-case execution time, hardware qualification, operational EO accuracy, formal safety, or mission-level fault tolerance. The watchdog is not spacecraft FDIR, the filesystem staging logic is not a platform-specific power-loss guarantee, and telemetry hashes are not cryptographic authentication. Real deployment would require representative sensor data, trusted provenance, sensor-specific radiometric ingestion, hardware-in-the-loop validation, resource and thermal limits, signed update and telemetry handling, fault injection, and mission-specific acceptance criteria.
 
 ## Requirements
 
