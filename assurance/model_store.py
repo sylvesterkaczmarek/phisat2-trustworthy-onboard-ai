@@ -21,6 +21,7 @@ from phi2_tile_filter.input_schema import (  # noqa: E402
     find_model_input_schema,
     validate_model_input_schema_binding,
 )
+from phi2_tile_filter.quality_guard import InputQualityGuard  # noqa: E402
 
 BUNDLE_SCHEMA_VERSION = 2
 BUNDLE_FORMAT_VERSION = 2
@@ -109,8 +110,9 @@ def _onnx_spec(path: Path) -> tuple[int, int]:
 def _validate_policy(
     policy: dict[str, Any], *, model_sha: str, contract_hash: str, ids: tuple[str, ...], bands: int, size: int, preprocessing_version: int
 ) -> None:
-    if policy.get("schema_version") != 4 or policy.get("split_role") != "calibration":
-        raise ValueError("deployment requires calibration policy schema version 4")
+    schema_version = policy.get("schema_version")
+    if schema_version not in (4, 5) or policy.get("split_role") != "calibration":
+        raise ValueError("deployment requires calibration policy schema version 4 or 5")
     if policy.get("model_sha256") != model_sha:
         raise ValueError("calibration policy belongs to a different model")
     if policy.get("input_schema_sha256") != contract_hash:
@@ -141,6 +143,8 @@ def _validate_policy(
     required = acceptance.get("required_min_event_recall_lower_bound")
     if required is not None and lower < float(required):
         raise ValueError("calibration policy does not meet its recall lower-bound requirement")
+    if schema_version == 5:
+        InputQualityGuard.from_payload(policy.get("input_quality_guard"))
 
 
 def _validate_validation(
