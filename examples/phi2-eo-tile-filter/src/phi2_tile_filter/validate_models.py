@@ -15,7 +15,7 @@ from sklearn.metrics import (
 from .bandwidth_filter import load_policy
 from .policy import DecisionPolicy, softmax
 from .runtime import OnnxRunner
-from .utils import discover_labeled_tiles, load_tile_numpy
+from .utils import discover_labeled_tiles, load_tile_numpy, sha256_file
 
 
 def _classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, event_scores: np.ndarray) -> dict:
@@ -114,6 +114,7 @@ def validate_models(
         raise ValueError("FP32 and INT8 model band ordering differs")
     int8.assert_data_schema(data_root)
     policy = load_policy(policy_path, int8)
+    policy_sha256 = sha256_file(policy_path)
 
     items = discover_labeled_tiles(data_root)
     if not items:
@@ -229,6 +230,7 @@ def validate_models(
         "validation_background_samples": int(np.sum(y == 0)),
         "fp32_sha256": fp32.model_sha256,
         "int8_sha256": int8.model_sha256,
+        "policy_sha256": policy_sha256,
         "input_schema_sha256": int8.input_schema_sha256,
         "input_band_ids": list(int8.band_ids),
         "preprocessing_version": int8.input_schema["preprocessing"]["version"],
