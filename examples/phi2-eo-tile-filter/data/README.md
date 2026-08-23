@@ -1,40 +1,28 @@
 # Data
 
-The demo generates deterministic synthetic tiles into four independent lifecycle splits:
+The main demo generates deterministic synthetic tiles into four independent lifecycle splits:
 
-- `train` is used only to fit model parameters.
-- `calib` is used for INT8 calibration and decision-threshold / temperature calibration.
-- `validation` is used for model and quantization acceptance gates.
-- `test` is reserved for final reporting after the candidate bundle has already been accepted and promoted.
+- `train` fits model parameters only.
+- `calib` performs INT8, threshold, temperature, and input-quality-guard calibration.
+- `validation` controls model and quantization acceptance.
+- `test` is reserved for final reporting after the candidate bundle is accepted and promoted.
 
-The generator uses independent child RNG streams for the four splits and records their roles and counts in `manifest.json`. Tests also check that generated tile contents do not overlap between splits.
+Independent child RNG streams are recorded in `manifest.json`, and tests check that generated tile contents do not overlap across lifecycle splits.
 
 ## Input contract
 
-Every generated dataset also contains `input_schema.json`. Its canonical SHA-256 is recorded in `manifest.json`, embedded in the training checkpoint, carried into FP32 and INT8 ONNX metadata, recorded by calibration and validation evidence, and bound into the deployment bundle.
+Every generated dataset contains `input_schema.json`. Its canonical SHA-256 is propagated through the dataset manifest, training checkpoint, FP32/INT8 ONNX metadata, calibration policy, validation evidence, telemetry, and deployment bundle.
 
-The schema describes the scientific meaning of the tensor interface rather than only its shape. It can record:
+The schema can record ordered band IDs/names, optional wavelength metadata, source/model layouts, dimensions, dtypes, radiometric range, normalization, nodata policy, preprocessing version, resize behaviour, and channel policy.
 
-- ordered band identifiers and names;
-- optional centre wavelength or wavelength range metadata;
-- source and model tensor layouts;
-- tile height and width;
-- source and model dtypes;
-- expected radiometric range;
-- normalization procedure and version;
-- nodata handling;
-- preprocessing implementation and version;
-- resize behaviour and channel-conversion policy.
+The synthetic dataset uses float32 HWC `.npy` tiles already scaled to `[0, 1]`, identity normalization, and reject-nodata semantics. The model receives float32 NCHW tensors.
 
-The synthetic dataset uses float32 `.npy` tiles in HWC layout, values already scaled to `[0, 1]`, identity normalization, and a reject-nodata policy. The model receives float32 NCHW tensors.
-
-A seven-band synthetic contract therefore looks conceptually like this:
+A seven-band synthetic contract uses generic bands such as:
 
 ```json
 {
   "schema_version": 2,
   "contract_type": "eo-input-preprocessing",
-  "preprocessing_sha256": "<canonical preprocessing fingerprint>",
   "tensor": {
     "model_layout": "NCHW",
     "source_layout": "HWC",
@@ -51,40 +39,49 @@ A seven-band synthetic contract therefore looks conceptually like this:
       {"index": 6, "id": "band_07", "name": "synthetic_band_07", "wavelength_nm": null}
     ]
   },
-  "source": {
-    "format": "npy",
-    "dtype": "float32",
-    "value_range": [0.0, 1.0]
-  },
-  "normalization": {
-    "name": "identity_unit_interval",
-    "version": 1,
-    "parameters": {}
-  },
-  "nodata": {
-    "policy": "reject",
-    "non_finite": "reject",
-    "values": []
-  },
-  "preprocessing": {
-    "name": "phi2_tile_filter.utils.load_tile_numpy",
-    "version": 2,
-    "channel_policy": "exact-no-implicit-conversion",
-    "tiff_policy": "reject-use-npy-or-mission-specific-loader"
-  }
+  "source": {"format": "npy", "dtype": "float32", "value_range": [0.0, 1.0]},
+  "normalization": {"name": "identity_unit_interval", "version": 1, "parameters": {}},
+  "nodata": {"policy": "reject", "non_finite": "reject", "values": []}
 }
 ```
 
-The `preprocessing_sha256` value fingerprints the normalization, nodata and preprocessing sections; the full `input_schema_sha256` additionally covers band order and all other contract fields.
+These names are intentionally generic. They are not PhiSat-2 band definitions or validated sensor wavelengths.
 
-The band names above are intentionally generic. They are **not** claimed to be PhiSat-2 spectral bands or wavelengths. A real dataset should replace them with validated sensor-specific identifiers, ordering, wavelengths, radiometric units/scaling, nodata semantics, and preprocessing metadata.
+## Robustness benchmark data
+
+The optional robustness benchmark is a separate post-deployment dataset. It does not enter training, calibration, validation, or model acceptance.
+
+It creates four deterministic categories:
+
+- `nominal`: the same lightweight square-event distribution used by the demo;
+- `degraded`: sensor-noise-like perturbations, illumination shifts, per-band gain/offset drift, blur, cloud-like occlusion, spatial shift, and spectral distribution shift;
+- `corrupted`: missing-band zero fill, non-finite corrupt bands, saturated regions, and dead-pixel/stripe patterns;
+- `ood`: unknown checkerboard, sinusoidal, radial, and striped backgrounds with altered spectral structure.
+
+The benchmark writes `benchmark_manifest.json` with every sample's category and perturbation recipe. All random generation is seed-controlled.
+
+These perturbations are deliberately synthetic stressors. They are **not** physically calibrated models of PhiSat-2 or any other EO sensor, atmosphere, detector, optics, compression chain, or cloud process. Their purpose is to test whether the decision and fallback logic behaves conservatively when input statistics move away from the nominal synthetic distribution.
+
+Example after running the main demo:
+
+```bash
+python scripts/run_robustness_benchmark.py \
+  --output-root /tmp/phi2-7band \
+  --samples-per-category 20 \
+  --seed 101 \
+  --event-prevalences 0.01,0.05,0.10
+```
+
+Perturbation magnitudes are configurable through command-line options so experiments can be repeated at fixed stress levels.
 
 ## File-format behaviour
 
-For strict model execution, the source format must match the model's input schema. The synthetic model contract is `.npy` only.
+For strict model execution, source format must match the model input schema. The synthetic model contract is `.npy`.
 
-The generic utility loader can read PNG or JPEG only when the channel count is already exact. It never converts RGB to RGBA, replicates grayscale into RGB, drops alpha, or otherwise invents/discards channels. Palette, CMYK and other modes require an explicit upstream conversion and corresponding contract.
+PNG/JPEG are accepted by the generic utility loader only with an already exact channel structure. No implicit channel manufacturing or dropping is performed. TIFF/GeoTIFF are deliberately rejected because scientific TIFF can carry high-bit-depth, multiband, geospatial, scale/offset, and nodata semantics requiring an EO-aware ingest path.
 
-TIFF and GeoTIFF are deliberately rejected by the generic loader. Scientific TIFF can carry high-bit-depth samples, multiple bands, georeferencing, nodata, scale/offset and other metadata that an 8-bit image conversion could silently destroy. Use validated `.npy` arrays under an explicit schema or add a mission-specific EO loader.
+## Interpretation
 
-The requested calibration recall remains a threshold-selection target on the calibration sample. It is not presented as a population guarantee; the calibration artifact reports empirical recall and a one-sided exact Clopper-Pearson lower confidence bound.
+The calibrated event-recall target is not a population guarantee; the policy records finite-sample Clopper-Pearson evidence. Likewise, the calibrated input-quality guard is a lightweight statistical-distance heuristic rather than a guaranteed OOD detector.
+
+Robustness reports describe source-file byte retention/reduction. They do not measure spacecraft link bandwidth or account for packetisation, coding, retransmission, framing, or contact geometry.
