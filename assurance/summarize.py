@@ -31,7 +31,7 @@ def _one_value(records: list[dict], key: str):
 
 
 def _calibration_metadata(calibration: dict) -> dict:
-    if calibration.get("schema_version") == 3:
+    if calibration.get("schema_version") in (3, 4):
         stats = calibration.get("calibration_statistics", {})
         acceptance = calibration.get("calibration_acceptance", {})
         return {
@@ -39,6 +39,9 @@ def _calibration_metadata(calibration: dict) -> dict:
             "min_confidence": calibration.get("min_confidence"),
             "temperature": calibration.get("temperature"),
             "temperature_fitted": calibration.get("temperature_fitted"),
+            "input_schema_sha256": calibration.get("input_schema_sha256"),
+            "input_band_ids": calibration.get("input_band_ids"),
+            "preprocessing_version": calibration.get("preprocessing_version"),
             "calibration_samples_total": stats.get("samples_total"),
             "calibration_event_samples": stats.get("event_samples"),
             "calibration_target_event_recall_for_threshold_selection": stats.get(
@@ -75,6 +78,11 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
         raise ValueError("final-test/downlink model hash mismatch")
     if calibration.get("model_sha256") != model_hash:
         raise ValueError("calibration belongs to a different model")
+    schema_hash = _one_value(test, "input_schema_sha256")
+    if _one_value(downlink, "input_schema_sha256") != schema_hash:
+        raise ValueError("final-test/downlink input schema hash mismatch")
+    if calibration.get("input_schema_sha256") != schema_hash:
+        raise ValueError("calibration input/preprocessing schema differs from final-test runtime")
 
     successful = [record for record in test if record.get("inference_ok")]
     y_true = np.array([int(record["true_class"]) for record in successful], dtype=int)
@@ -95,18 +103,27 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
     event_records = [record for record in test if int(record["true_class"]) == 1]
     background_records = [record for record in test if int(record["true_class"]) == 0]
     event_kept = sum(bool(down_by_file[record["file"]]["kept"]) for record in event_records)
-    background_discarded = sum(not bool(down_by_file[record["file"]]["kept"]) for record in background_records)
+    background_discarded = sum(
+        not bool(down_by_file[record["file"]]["kept"]) for record in background_records
+    )
     event_retention_recall = event_kept / len(event_records) if event_records else 0.0
-    background_rejection_rate = background_discarded / len(background_records) if background_records else 0.0
+    background_rejection_rate = (
+        background_discarded / len(background_records) if background_records else 0.0
+    )
 
     total_bytes = sum(int(record["size_bytes"]) for record in downlink)
     kept_bytes = sum(int(record["size_bytes"]) for record in downlink if record["kept"])
-    latencies = [float(record["latency_ms"]) for record in successful if record.get("latency_ms") is not None]
+    latencies = [
+        float(record["latency_ms"])
+        for record in successful
+        if record.get("latency_ms") is not None
+    ]
 
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "split_role": "final_test",
         "model_sha256": model_hash,
+        "input_schema_sha256": schema_hash,
         "final_test_sample_counts": {
             "samples_total": len(test),
             "event_samples": len(event_records),
@@ -130,10 +147,14 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
             "background_rejection_rate": float(background_rejection_rate),
             "tiles_kept": sum(bool(record["kept"]) for record in downlink),
             "tiles_total": len(downlink),
-            "fallback_tiles": sum(str(record["decision"]).endswith("fallback") for record in downlink),
+            "fallback_tiles": sum(
+                str(record["decision"]).endswith("fallback") for record in downlink
+            ),
             "bytes_total": total_bytes,
             "bytes_kept": kept_bytes,
-            "downlink_bytes_saved_pct": 100.0 * (1.0 - kept_bytes / total_bytes) if total_bytes else 0.0,
+            "downlink_bytes_saved_pct": (
+                100.0 * (1.0 - kept_bytes / total_bytes) if total_bytes else 0.0
+            ),
         },
         "final_test_runtime_metrics": {
             "avg_inference_latency_ms": float(np.mean(latencies)) if latencies else None,

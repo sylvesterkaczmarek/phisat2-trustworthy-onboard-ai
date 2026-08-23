@@ -14,6 +14,7 @@ from .utils import discover_labeled_tiles, load_tile_numpy
 
 def evaluate(model: str | Path, data: str | Path, *, temperature: float = 1.0) -> dict:
     runner = OnnxRunner(model)
+    runner.assert_data_schema(data)
     items = discover_labeled_tiles(data)
     if not items:
         raise ValueError(f"no labeled tiles found under {data}")
@@ -22,7 +23,7 @@ def evaluate(model: str | Path, data: str | Path, *, temperature: float = 1.0) -
     event_scores: list[float] = []
     latencies: list[float] = []
     for path, cls in items:
-        array = load_tile_numpy(path, bands=runner.spec.bands, size=runner.spec.size)
+        array = load_tile_numpy(path, input_schema=runner.input_schema)
         logits, latency = runner.logits_for_array(array)
         probs = softmax(logits, temperature=temperature)[0]
         y_true.append(cls)
@@ -34,8 +35,11 @@ def evaluate(model: str | Path, data: str | Path, *, temperature: float = 1.0) -
     )
     auc = float(roc_auc_score(y_true, event_scores)) if len(set(y_true)) == 2 else None
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_sha256": runner.model_sha256,
+        "input_schema_sha256": runner.input_schema_sha256,
+        "input_band_ids": list(runner.band_ids),
+        "preprocessing_version": runner.input_schema["preprocessing"]["version"],
         "samples": len(items),
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "event_precision": float(precision[0]),

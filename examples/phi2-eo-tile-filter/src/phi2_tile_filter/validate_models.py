@@ -96,6 +96,11 @@ def validate_models(
     int8 = OnnxRunner(int8_path)
     if fp32.spec != int8.spec:
         raise ValueError("FP32 and INT8 model input specifications differ")
+    if fp32.input_schema_sha256 != int8.input_schema_sha256:
+        raise ValueError("FP32 and INT8 models are bound to different input/preprocessing schemas")
+    if fp32.band_ids != int8.band_ids:
+        raise ValueError("FP32 and INT8 model band ordering differs")
+    int8.assert_data_schema(data_root)
     policy = load_policy(policy_path, int8)
 
     items = discover_labeled_tiles(data_root)
@@ -106,7 +111,7 @@ def validate_models(
     fp32_logits_list: list[np.ndarray] = []
     int8_logits_list: list[np.ndarray] = []
     for path, cls in items:
-        array = load_tile_numpy(path, bands=fp32.spec.bands, size=fp32.spec.size)
+        array = load_tile_numpy(path, input_schema=int8.input_schema)
         fp32_logits, _ = fp32.logits_for_array(array)
         int8_logits, _ = int8.logits_for_array(array)
         y_true.append(cls)
@@ -135,7 +140,9 @@ def validate_models(
     score_drift = np.abs(fp32_scores - int8_scores)
     classification_regression = {
         "accuracy_drop": float(fp32_classification["accuracy"] - int8_classification["accuracy"]),
-        "event_recall_drop": float(fp32_classification["event_recall"] - int8_classification["event_recall"]),
+        "event_recall_drop": float(
+            fp32_classification["event_recall"] - int8_classification["event_recall"]
+        ),
         "event_false_negative_rate_increase": float(
             int8_classification["event_false_negative_rate"]
             - fp32_classification["event_false_negative_rate"]
@@ -153,7 +160,9 @@ def validate_models(
         "event_retention_recall_drop": float(
             fp32_policy["event_retention_recall"] - int8_policy["event_retention_recall"]
         ),
-        "retained_fraction_change": float(int8_policy["retained_fraction"] - fp32_policy["retained_fraction"]),
+        "retained_fraction_change": float(
+            int8_policy["retained_fraction"] - fp32_policy["retained_fraction"]
+        ),
     }
     score_drift_metrics = {
         "mean_absolute_event_score_drift": float(np.mean(score_drift)),
@@ -173,30 +182,41 @@ def validate_models(
     }
     checks = {
         "classification_accuracy_drop": classification_regression["accuracy_drop"] <= max_accuracy_drop,
-        "classification_argmax_agreement": classification_regression["argmax_agreement"] >= min_argmax_agreement,
-        "classification_event_recall_drop": classification_regression["event_recall_drop"] <= max_event_recall_drop,
+        "classification_argmax_agreement": (
+            classification_regression["argmax_agreement"] >= min_argmax_agreement
+        ),
+        "classification_event_recall_drop": (
+            classification_regression["event_recall_drop"] <= max_event_recall_drop
+        ),
         "classification_event_false_negative_rate_increase": (
-            classification_regression["event_false_negative_rate_increase"] <= max_event_fnr_increase
+            classification_regression["event_false_negative_rate_increase"]
+            <= max_event_fnr_increase
         ),
         "classification_pr_auc_drop": classification_regression["pr_auc_drop"] <= max_pr_auc_drop,
         "policy_retention_decision_agreement": (
             policy_regression["retention_decision_agreement"] >= min_policy_decision_agreement
         ),
         "policy_event_retention_recall_drop": (
-            policy_regression["event_retention_recall_drop"] <= max_event_retention_recall_drop
+            policy_regression["event_retention_recall_drop"]
+            <= max_event_retention_recall_drop
         ),
-        "event_score_drift": score_drift_metrics["max_absolute_event_score_drift"] <= max_event_score_drift,
+        "event_score_drift": (
+            score_drift_metrics["max_absolute_event_score_drift"] <= max_event_score_drift
+        ),
     }
     accepted = all(checks.values())
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "split_role": "validation",
         "validation_samples": len(items),
         "validation_event_samples": int(np.sum(y == 1)),
         "validation_background_samples": int(np.sum(y == 0)),
         "fp32_sha256": fp32.model_sha256,
         "int8_sha256": int8.model_sha256,
+        "input_schema_sha256": int8.input_schema_sha256,
+        "input_band_ids": list(int8.band_ids),
+        "preprocessing_version": int8.input_schema["preprocessing"]["version"],
         "policy_model_sha256": int8.model_sha256,
         "policy_temperature": float(policy.temperature),
         "classification_metrics": {

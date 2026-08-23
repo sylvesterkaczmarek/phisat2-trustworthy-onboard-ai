@@ -12,16 +12,27 @@ from .utils import discover_tile_files
 
 def load_policy(path: str | Path, runner: OnnxRunner) -> DecisionPolicy:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if payload.get("schema_version") not in (2, 3):
-        raise ValueError("unsupported calibration policy schema")
+    if payload.get("schema_version") != 4:
+        raise ValueError(
+            "unsupported calibration policy schema; policies must include an explicit input/preprocessing contract"
+        )
     if payload.get("model_sha256") != runner.model_sha256:
         raise ValueError("calibration policy belongs to a different model")
-    if int(payload.get("bands", -1)) != runner.spec.bands or int(payload.get("size", -1)) != runner.spec.size:
+    if payload.get("input_schema_sha256") != runner.input_schema_sha256:
+        raise ValueError("calibration policy input/preprocessing schema does not match the model")
+    if tuple(payload.get("input_band_ids", [])) != runner.band_ids:
+        raise ValueError("calibration policy band ordering does not match the model input schema")
+    if int(payload.get("preprocessing_version", -1)) != int(
+        runner.input_schema["preprocessing"]["version"]
+    ):
+        raise ValueError("calibration policy preprocessing version does not match the model")
+    if int(payload.get("bands", -1)) != runner.spec.bands or int(
+        payload.get("size", -1)
+    ) != runner.spec.size:
         raise ValueError("calibration policy input shape does not match model")
-    if payload.get("schema_version") == 3:
-        acceptance = payload.get("calibration_acceptance")
-        if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
-            raise ValueError("calibration policy is not marked accepted")
+    acceptance = payload.get("calibration_acceptance")
+    if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
+        raise ValueError("calibration policy is not marked accepted")
     return DecisionPolicy(
         event_threshold=float(payload["event_threshold"]),
         min_confidence=float(payload["min_confidence"]),
@@ -40,6 +51,7 @@ def filter_tiles(
     runner = OnnxRunner(model_path)
     policy = load_policy(policy_path, runner)
     data_root = Path(data_root)
+    runner.assert_data_schema(data_root)
     files = discover_tile_files(data_root)
     if not files:
         raise ValueError(f"no supported tiles found under {data_root}")
@@ -76,8 +88,9 @@ def filter_tiles(
 
     saved_fraction = 1.0 - kept_bytes / total_bytes if total_bytes else 0.0
     summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model_sha256": runner.model_sha256,
+        "input_schema_sha256": runner.input_schema_sha256,
         "tiles_total": len(files),
         "tiles_kept": kept_count,
         "fallback_tiles": fallback_count,

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from .input_schema import input_schema_sha256, read_input_schema
 from .models.tiny_cnn import TinyCNN
 from .utils import make_loader, read_dataset_manifest, seed_everything, sha256_file
 
@@ -25,9 +27,16 @@ def train(
 ) -> dict:
     if epochs <= 0 or lr <= 0.0 or base <= 0:
         raise ValueError("epochs, lr, and base must be positive")
+    data_root = Path(data_root)
     manifest = read_dataset_manifest(data_root)
-    bands = int(manifest["bands"])
-    size = int(manifest["size"])
+    input_schema = read_input_schema(data_root / "input_schema.json")
+    schema_hash = input_schema_sha256(input_schema)
+    if manifest.get("input_schema_sha256") != schema_hash:
+        raise ValueError("dataset manifest and input_schema.json disagree")
+    bands = len(input_schema["tensor"]["bands"])
+    size = int(input_schema["tensor"]["height"])
+    if int(input_schema["tensor"]["width"]) != size:
+        raise ValueError("TinyCNN demonstrator requires square input tiles")
     seed_everything(seed)
 
     device = torch.device(device_name)
@@ -35,12 +44,11 @@ def train(
         raise RuntimeError("CUDA requested but unavailable")
 
     loader = make_loader(
-        Path(data_root) / "train",
+        data_root / "train",
         batch=batch,
         shuffle=True,
-        bands=bands,
-        size=size,
         seed=seed,
+        input_schema=input_schema,
     )
     model = TinyCNN(in_ch=bands, base=base).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -67,12 +75,14 @@ def train(
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
-        "format_version": 2,
+        "format_version": 3,
         "architecture": "TinyCNN",
         "in_ch": bands,
         "num_classes": 2,
         "base": int(base),
         "input_size": size,
+        "input_schema": deepcopy(input_schema),
+        "input_schema_sha256": schema_hash,
         "seed": int(seed),
         "epochs": int(epochs),
         "lr": float(lr),
@@ -80,8 +90,12 @@ def train(
     }
     torch.save(checkpoint, destination)
     summary = {
+        "schema_version": 2,
         "checkpoint": str(destination),
         "checkpoint_sha256": sha256_file(destination),
+        "input_schema_sha256": schema_hash,
+        "input_band_ids": [band["id"] for band in input_schema["tensor"]["bands"]],
+        "preprocessing_version": input_schema["preprocessing"]["version"],
         "bands": bands,
         "size": size,
         "base": base,

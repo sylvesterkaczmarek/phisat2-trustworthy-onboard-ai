@@ -8,15 +8,15 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17567181.svg)](https://doi.org/10.5281/zenodo.17567181)
 
-Research demonstrator for deterministic Earth-observation tile triage, PyTorch to ONNX deployment, static INT8 quantization, conservative downlink fallback, telemetry, and coherent model-policy deployment rollback. The workflow is inspired by onboard EO processing such as PhiSat-2, but it is independent software and is not ESA or PhiSat-2 flight code.
+Research demonstrator for deterministic Earth-observation tile triage, PyTorch to ONNX deployment, static INT8 quantization, conservative downlink fallback, telemetry, and coherent model-policy-preprocessing deployment rollback. The workflow is inspired by onboard EO processing such as PhiSat-2, but it is independent software and is not ESA or PhiSat-2 flight code.
 
 ## At a glance
 
 ```mermaid
 flowchart LR
-    A[Train split] --> B[TinyCNN]
-    B --> C[FP32 ONNX]
-    C --> D[INT8 QDQ]
+    A[Train split + input schema] --> B[TinyCNN checkpoint]
+    B --> C[FP32 ONNX + schema hash]
+    C --> D[INT8 QDQ + same schema hash]
     E[Calibration split] --> F[Threshold, temperature, recall bound]
     D --> F
     V[Validation split] --> G[Quantization and policy acceptance]
@@ -32,34 +32,32 @@ flowchart LR
     H --> J[Telemetry and final report]
 ```
 
-The design uses four independent data roles: training fits model parameters, calibration selects the INT8 calibration and decision policy, validation decides whether the quantized candidate is acceptable, and the final test is used only after deployment acceptance. A deployable configuration is an immutable bundle that cryptographically binds the ONNX model to its calibration policy, preprocessing metadata, and validation evidence.
+The design uses four independent data roles and a versioned input/preprocessing contract. A deployable configuration is an immutable bundle that cryptographically binds the ONNX model to its band ordering, preprocessing schema, calibration policy, and validation evidence.
 
 ## What is implemented
 
 - deterministic synthetic EO data generation with independent `train`, `calib`, `validation`, and final `test` splits
+- versioned EO input schema with ordered band metadata, optional wavelength metadata, layout, dtype/range, normalization, nodata policy, and preprocessing version
+- canonical input-contract SHA-256 propagated through dataset, checkpoint, ONNX, calibration, validation, telemetry, and deployment bundle
 - arbitrary multispectral band counts through NumPy tile stacks
-- deterministic TinyCNN training with architecture metadata stored in the checkpoint
-- PyTorch to FP32 ONNX export with ONNX validation and numerical equivalence check
-- static QDQ INT8 quantization with calibration data kept separate from final test data
+- deterministic TinyCNN training with architecture and input-contract metadata stored in the checkpoint
+- PyTorch to FP32 ONNX export with ONNX validation, numerical equivalence check, model metadata binding, and schema sidecar
+- static QDQ INT8 quantization that preserves and verifies the same input contract
 - validation-only FP32 versus INT8 gates for accuracy, event recall/FNR, F1, PR-AUC, score drift, argmax agreement, and calibrated retain/discard decisions
 - calibrated event threshold with empirical recall and a one-sided exact Clopper-Pearson lower confidence bound
 - optional acceptance gate on the calibration recall lower bound
-- optional deterministic temperature scaling on the calibration split
 - conservative fallback that downlinks low-confidence tiles and inference failures
-- deployment bundles containing model, policy, preprocessing/input schema, validation evidence, and hashes
-- content-addressed immutable bundle storage with atomic active/previous deployment state
-- exact validation-report-to-model hash binding before promotion
-- per-tile input and model SHA-256 telemetry
-- exact byte-level bandwidth accounting
-- coherent model-policy rollback
-- bounded watchdog without `shell=True`
+- strict channel handling with no implicit grayscale replication, alpha addition, or channel dropping
+- deterministic rejection of ambiguous legacy CHW/HWC NumPy layouts
+- deliberate rejection of TIFF/GeoTIFF by the generic loader rather than unsafe 8-bit conversion
+- content-addressed immutable deployment bundles with coherent rollback
 - CI that runs the full multispectral pipeline
 
 ## Decision policy
 
 A tile is retained when it is predicted to contain the target event, when confidence is below the configured minimum, or when preprocessing/inference fails. Only confidently classified background data are discarded.
 
-This is intentionally conservative about science-data loss. See [docs/assurance.md](docs/assurance.md).
+See [docs/assurance.md](docs/assurance.md) for the assurance model and limitations.
 
 ## Quick start
 
@@ -78,16 +76,19 @@ A multispectral run uses the same pipeline:
 python scripts/run_demo.py --n 160 --bands 7 --size 32 --epochs 2 --seed 0 --output-root /tmp/phi2-7band
 ```
 
-The synthetic generator uses `.npy` arrays so band counts greater than RGB are preserved without pretending that PNG is a multispectral format.
+The generated dataset contains `input_schema.json`. For the synthetic seven-band example, its bands are deliberately named `band_01` through `band_07`. Those identifiers are generic and do not claim to reproduce PhiSat-2 spectral response or band definitions.
 
 ## Generated outputs
 
 A complete run produces:
 
 ```text
+tiles/input_schema.json
 calibration.json
 logs/test.jsonl
 logs/downlink.jsonl
+models/tinycnn_fp32.onnx.input_schema.json
+models/tinycnn_int8.onnx.input_schema.json
 models/candidate_bundle/
 models/bundles/<bundle_id>/
 models/deployment_state.json
@@ -96,32 +97,50 @@ reports/metrics.json
 reports/summary.md
 ```
 
-Each stored bundle contains `model.onnx`, `policy.json`, `input_schema.json`, `validation.json`, and `bundle.json`. The deployment-state file names the active and previous bundle by content-derived bundle ID.
-
-The final report is generated only from the reserved test split after the candidate bundle has passed calibration and validation. Metric namespaces distinguish final-test model classification, calibration-policy evidence, final-test downlink retention, and runtime measurements. The requested calibration recall is explicitly a threshold-selection target, not a claimed population guarantee.
+Each stored bundle contains `model.onnx`, `policy.json`, `input_schema.json`, `validation.json`, and `bundle.json`. The bundle records both file hashes and a canonical semantic input-contract hash.
 
 ## Validation gates
 
 The pipeline fails rather than silently continuing when:
 
-- the checkpoint architecture metadata do not match the exporter
-- PyTorch and FP32 ONNX outputs exceed the configured numerical tolerance
-- ONNX structural validation fails
-- the quantized artifact lacks the expected QDQ operators
-- validation-split INT8 accuracy, event recall/FNR, PR-AUC, or calibrated retention behaviour regresses beyond configured limits
-- FP32 and INT8 argmax or retain/discard agreement falls below configured limits
-- event-score drift exceeds its configured validation limit
+- a dataset manifest and input schema disagree
+- checkpoint architecture and input-contract metadata disagree
+- ONNX model metadata does not match its schema sidecar
+- FP32 and INT8 models use different preprocessing contracts or band ordering
+- calibration/validation/test data declare a different input schema from the model
+- a calibration policy has a different model or input-contract hash
+- validation-split INT8 accuracy, event recall/FNR, PR-AUC, score drift, or calibrated retention behaviour regresses beyond configured limits
 - an optional calibration recall lower-bound requirement is not met
-- a calibration file belongs to a different model hash or input shape
-- the validation report does not cover the exact candidate INT8 model or is not explicitly from the validation split
-- any bundle component is missing or has a mismatched SHA-256
-- the bundle manifest or deployment state is inconsistent
+- any bundle component or semantic input-contract binding is inconsistent
 
-The active deployment is changed only after calibration, validation-only acceptance, bundle construction, and bundle verification have completed successfully. The final test split is not used to decide whether the candidate is accepted.
+The final test split is not used to decide whether the candidate is accepted.
+
+## Input and preprocessing contract
+
+`input_schema.json` describes more than `(bands, height, width)`. It can represent:
+
+- ordered band identifiers and human-readable names
+- optional centre wavelengths or wavelength ranges
+- source layout and model layout
+- tile height and width
+- source dtype and expected radiometric range
+- model dtype
+- normalization procedure and version
+- nodata policy
+- preprocessing implementation and version
+- resize behaviour
+
+Changing any of those fields changes the canonical contract hash. Runtime checks that the ONNX metadata, schema sidecar, calibration policy, validation evidence, deployment bundle, and data-root schema all agree before model input is accepted.
+
+For NumPy data, an explicit schema removes CHW/HWC guessing. The legacy shape-based utility path rejects arrays that are plausible in both layouts.
+
+PNG and JPEG are handled only with their existing `L`, `RGB`, or `RGBA` channel structure. The loader does not call PIL conversion to manufacture or discard channels. TIFF and GeoTIFF are deliberately rejected because scientific TIFF frequently carries high-bit-depth, multiband, geospatial, scale/offset and nodata semantics that require an EO-aware ingest path.
+
+See [examples/phi2-eo-tile-filter/data/README.md](examples/phi2-eo-tile-filter/data/README.md) for a seven-band schema example.
 
 ## Deployment bundle handling
 
-Build a candidate bundle only after validation and calibration have succeeded:
+Build a candidate only after calibration and validation have succeeded:
 
 ```bash
 python ../../assurance/model_store.py build \
@@ -131,80 +150,28 @@ python ../../assurance/model_store.py build \
   --out models/candidate_bundle
 ```
 
-Promote the complete bundle into the immutable store:
+`build` automatically uses the schema sidecar bound to the ONNX model. An explicit `--input-schema` may be supplied, but it must have the same canonical hash as the model metadata, policy, and validation evidence.
+
+Promotion and rollback operate on the complete bundle:
 
 ```bash
 python ../../assurance/model_store.py promote \
   --candidate-bundle models/candidate_bundle \
   --store models/bundles \
   --state models/deployment_state.json
-```
 
-Resolve and verify the active deployment:
-
-```bash
-python ../../assurance/model_store.py resolve \
-  --store models/bundles \
-  --state models/deployment_state.json
-```
-
-Rollback swaps the active and previous bundle identifiers, so the model, policy, input schema, and validation evidence move together:
-
-```bash
 bash ../../assurance/rollback.sh
 ```
 
-## Watchdog
-
-The watchdog takes an explicit argv list and does not execute a shell command string. For an active deployment, resolve the bundle first and pass its `model` path to the inference command.
-
-```bash
-python ../../assurance/watchdog.py --restarts 3 --sleep-s 2 --cwd . -- \
-  python -m phi2_tile_filter.infer_onnx --onnx /path/to/resolved/model.onnx --data tiles/test
-```
-
-## Data interface
-
-The demonstration accepts image files for 1, 3, or 4 bands and `.npy` arrays for arbitrary multispectral input. Floating-point NumPy tiles must already be scaled to `[0, 1]`. Real mission data should have a documented preprocessing and radiometric normalization pipeline rather than relying on this toy loader.
-
-The deployment bundle records the current demo input contract, including layout, bands, spatial size, dtype, value range, and preprocessing identifier. This is integrity metadata for the demonstrator, not a substitute for a mission-specific radiometric pipeline.
-
 ## Reproducibility
 
-See [docs/reproducibility.md](docs/reproducibility.md). Training seeds Python, NumPy, PyTorch, and DataLoader shuffling. The dataset manifest records all four split roles and independent RNG child streams. CI performs the end-to-end pipeline using a seven-band synthetic dataset and checks that validation and final-test reporting use different partitions.
+See [docs/reproducibility.md](docs/reproducibility.md). Training seeds Python, NumPy, PyTorch, and DataLoader shuffling. The dataset manifest records all four split roles, independent RNG child streams, and the input-contract hash.
 
 ## What this repository does not claim
 
-This repository is a software and assurance demonstrator. The synthetic benchmark is deliberately simple. Clopper-Pearson bounds quantify sampling uncertainty under a binomial model but do not establish mission-level recall under distribution shift. The repository does not establish PhiSat-2 performance, flight readiness, radiation tolerance, worst-case execution time, hardware qualification, operational EO accuracy, formal safety, or mission-level fault tolerance.
+This repository is a software and assurance demonstrator. The synthetic benchmark is deliberately simple. Input-contract hashes prove consistency between declared metadata; they do not prove that an upstream producer labelled raw sensor arrays correctly. The generic seven-band schema does not reproduce PhiSat-2 bands or radiometry.
 
-The watchdog and deployment helpers are process-level examples rather than flight-qualified FDIR. Real onboard deployment would also require representative sensor data, hardware-in-the-loop validation, resource and thermal limits, platform-specific persistent storage guarantees, signed model/update handling, fault injection, and mission-specific acceptance criteria.
-
-## Repository layout
-
-```text
-.
-├── .github/workflows/ci.yml
-├── assurance/
-│   ├── model_store.py
-│   ├── rollback.sh
-│   ├── summarize.py
-│   ├── telemetry_log.py
-│   └── watchdog.py
-├── docs/
-│   ├── assurance.md
-│   └── reproducibility.md
-├── examples/phi2-eo-tile-filter/
-│   ├── data/
-│   ├── scripts/run_demo.py
-│   ├── src/phi2_tile_filter/
-│   ├── tests/
-│   ├── pyproject.toml
-│   └── requirements.txt
-├── CITATION.cff
-├── LICENSE
-├── Makefile
-└── README.md
-```
+The repository does not establish flight readiness, radiation tolerance, worst-case execution time, hardware qualification, operational EO accuracy, formal safety, or mission-level fault tolerance. Real deployment would require representative sensor data, trusted provenance, sensor-specific radiometric ingestion, hardware-in-the-loop validation, resource and thermal limits, signed update handling, fault injection, and mission-specific acceptance criteria.
 
 ## Requirements
 
@@ -213,7 +180,7 @@ The watchdog and deployment helpers are process-level examples rather than fligh
 - ONNX and ONNX Runtime for export, quantization, and inference
 - no accelerator is required for the CI-scale CPU demonstration
 
-Exact dependency bounds are defined in [`examples/phi2-eo-tile-filter/pyproject.toml`](examples/phi2-eo-tile-filter/pyproject.toml) and mirrored in [`requirements.txt`](examples/phi2-eo-tile-filter/requirements.txt).
+Exact dependency bounds are defined in [`examples/phi2-eo-tile-filter/pyproject.toml`](examples/phi2-eo-tile-filter/pyproject.toml).
 
 ## Cite this repository
 
