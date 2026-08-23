@@ -27,7 +27,12 @@ def fit_temperature(logits: np.ndarray, labels: np.ndarray) -> float:
     return float(grid[int(np.argmin(losses))])
 
 
-def clopper_pearson_lower_bound(successes: int, trials: int, *, confidence_level: float = 0.95) -> float:
+def clopper_pearson_lower_bound(
+    successes: int,
+    trials: int,
+    *,
+    confidence_level: float = 0.95,
+) -> float:
     """One-sided exact Clopper-Pearson lower confidence bound for a binomial proportion."""
     if trials <= 0:
         raise ValueError("trials must be positive")
@@ -65,17 +70,20 @@ def calibrate(
         raise ValueError("min_confidence must be in [0, 1]")
     if not (0.0 < confidence_level < 1.0):
         raise ValueError("confidence_level must be in (0, 1)")
-    if min_event_recall_lower_bound is not None and not (0.0 <= min_event_recall_lower_bound <= 1.0):
+    if min_event_recall_lower_bound is not None and not (
+        0.0 <= min_event_recall_lower_bound <= 1.0
+    ):
         raise ValueError("min_event_recall_lower_bound must be in [0, 1]")
 
     runner = OnnxRunner(model_path)
+    runner.assert_data_schema(data_root)
     items = discover_labeled_tiles(data_root)
     if not items:
         raise ValueError("calibration set is empty")
     labels: list[int] = []
     logits_list: list[np.ndarray] = []
     for path, cls in items:
-        array = load_tile_numpy(path, bands=runner.spec.bands, size=runner.spec.size)
+        array = load_tile_numpy(path, input_schema=runner.input_schema)
         logits, _ = runner.logits_for_array(array)
         logits_list.append(logits[0])
         labels.append(cls)
@@ -108,9 +116,12 @@ def calibrate(
         or recall_lower_bound >= min_event_recall_lower_bound
     )
     result = {
-        "schema_version": 3,
+        "schema_version": 4,
         "split_role": "calibration",
         "model_sha256": runner.model_sha256,
+        "input_schema_sha256": runner.input_schema_sha256,
+        "input_band_ids": list(runner.band_ids),
+        "preprocessing_version": runner.input_schema["preprocessing"]["version"],
         "bands": runner.spec.bands,
         "size": runner.spec.size,
         "event_threshold": policy.event_threshold,
@@ -132,7 +143,9 @@ def calibrate(
         },
         "calibration_acceptance": {
             "required_min_event_recall_lower_bound": (
-                None if min_event_recall_lower_bound is None else float(min_event_recall_lower_bound)
+                None
+                if min_event_recall_lower_bound is None
+                else float(min_event_recall_lower_bound)
             ),
             "accepted": bool(accepted),
         },

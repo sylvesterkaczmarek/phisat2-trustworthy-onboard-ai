@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .input_schema import build_input_schema, input_schema_sha256, write_input_schema
+
 SPLITS = ("train", "calib", "validation", "test")
 CLASSES = ("background", "event")
 SPLIT_ROLES = {
@@ -49,10 +51,7 @@ def split_counts(
     if sum(fractions.values()) >= 1.0:
         raise ValueError("train_fraction + calib_fraction + validation_fraction must be < 1")
 
-    counts = {
-        name: max(2, int(round(total * fraction)))
-        for name, fraction in fractions.items()
-    }
+    counts = {name: max(2, int(round(total * fraction))) for name, fraction in fractions.items()}
     counts["test"] = total - sum(counts.values())
     if counts["test"] < 2:
         raise ValueError("test split would contain fewer than two samples")
@@ -81,6 +80,19 @@ def write_dataset(
         shutil.rmtree(root)
     root.mkdir(parents=True)
 
+    input_schema = build_input_schema(
+        bands=bands,
+        height=size,
+        source_layout="HWC",
+        source_format="npy",
+        source_dtype="float32",
+        value_range=(0.0, 1.0),
+        normalization_name="identity_unit_interval",
+        normalization_version=1,
+        nodata_policy="reject",
+    )
+    schema_hash = write_input_schema(root / "input_schema.json", input_schema)
+
     seed_sequence = np.random.SeedSequence(seed)
     child_sequences = seed_sequence.spawn(len(SPLITS))
     split_seed_spawn_keys: dict[str, list[int]] = {}
@@ -101,8 +113,8 @@ def write_dataset(
             np.save(destination, tile, allow_pickle=False)
 
     manifest = {
-        "schema_version": 2,
-        "generator": "synthetic-square-event-v3-four-way",
+        "schema_version": 3,
+        "generator": "synthetic-square-event-v4-explicit-input-contract",
         "seed": int(seed),
         "samples": int(sum(counts.values())),
         "bands": int(bands),
@@ -118,6 +130,9 @@ def write_dataset(
             "test": float(1.0 - train_fraction - calib_fraction - validation_fraction),
         },
         "tile_format": "npy-float32-hwc-0to1",
+        "input_schema_file": "input_schema.json",
+        "input_schema_sha256": schema_hash,
+        "input_band_ids": [band["id"] for band in input_schema["tensor"]["bands"]],
     }
     (root / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"

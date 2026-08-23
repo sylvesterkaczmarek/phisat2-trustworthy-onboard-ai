@@ -16,10 +16,16 @@ from phi2_tile_filter.runtime import OnnxRunner  # noqa: E402
 from phi2_tile_filter.utils import CLASS_NAMES, discover_labeled_tiles  # noqa: E402
 
 
-def emit_telemetry(model_path: str | Path, data_root: str | Path, policy_path: str | Path, output: str | Path) -> dict:
+def emit_telemetry(
+    model_path: str | Path,
+    data_root: str | Path,
+    policy_path: str | Path,
+    output: str | Path,
+) -> dict:
     runner = OnnxRunner(model_path)
     policy = load_policy(policy_path, runner)
     data_root = Path(data_root)
+    runner.assert_data_schema(data_root)
     items = discover_labeled_tiles(data_root)
     if not items:
         raise ValueError(f"no labeled tiles found under {data_root}")
@@ -36,10 +42,13 @@ def emit_telemetry(model_path: str | Path, data_root: str | Path, policy_path: s
                 failures += 1
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "samples": len(items),
         "inference_failures": failures,
         "model_sha256": runner.model_sha256,
+        "input_schema_sha256": runner.input_schema_sha256,
+        "input_band_ids": list(runner.band_ids),
+        "preprocessing_version": runner.input_schema["preprocessing"]["version"],
         "output": str(output),
     }
     print(json.dumps(result, indent=2, sort_keys=True))

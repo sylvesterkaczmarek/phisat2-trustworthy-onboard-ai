@@ -9,19 +9,38 @@ import onnx
 import onnxruntime as ort
 import torch
 
+from .input_schema import (
+    input_schema_sha256,
+    model_schema_sidecar_path,
+    validate_input_schema,
+    write_input_schema,
+)
 from .models.tiny_cnn import TinyCNN
 from .utils import sha256_file
 
 
 def load_checkpoint(path: str | Path) -> dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if not isinstance(checkpoint, dict) or checkpoint.get("format_version") != 2:
-        raise ValueError("unsupported checkpoint format")
-    required = {"architecture", "in_ch", "num_classes", "base", "input_size", "state_dict"}
+    if not isinstance(checkpoint, dict) or checkpoint.get("format_version") != 3:
+        raise ValueError("unsupported checkpoint format; retrain with the versioned input contract")
+    required = {
+        "architecture",
+        "in_ch",
+        "num_classes",
+        "base",
+        "input_size",
+        "input_schema",
+        "input_schema_sha256",
+        "state_dict",
+    }
     if not required.issubset(checkpoint):
         raise ValueError("checkpoint metadata is incomplete")
     if checkpoint["architecture"] != "TinyCNN":
         raise ValueError("unsupported architecture")
+    validate_input_schema(checkpoint["input_schema"])
+    schema_hash = input_schema_sha256(checkpoint["input_schema"])
+    if checkpoint["input_schema_sha256"] != schema_hash:
+        raise ValueError("checkpoint input schema hash does not match embedded input schema")
     return checkpoint
 
 
@@ -31,6 +50,11 @@ def export_model(weights: str | Path, output: str | Path, *, verify_atol: float 
     classes = int(checkpoint["num_classes"])
     base = int(checkpoint["base"])
     size = int(checkpoint["input_size"])
+    input_schema = checkpoint["input_schema"]
+    schema_hash = input_schema_sha256(input_schema)
+    tensor = input_schema["tensor"]
+    if len(tensor["bands"]) != bands or int(tensor["height"]) != size or int(tensor["width"]) != size:
+        raise ValueError("checkpoint architecture and input schema dimensions disagree")
 
     model = TinyCNN(in_ch=bands, num_classes=classes, base=base)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
@@ -65,10 +89,15 @@ def export_model(weights: str | Path, output: str | Path, *, verify_atol: float 
             "num_classes": str(classes),
             "checkpoint_sha256": sha256_file(weights),
             "batch_dimension": "dynamic",
+            "input_schema_version": str(input_schema["schema_version"]),
+            "input_schema_sha256": schema_hash,
+            "preprocessing_name": str(input_schema["preprocessing"]["name"]),
+            "preprocessing_version": str(input_schema["preprocessing"]["version"]),
         },
     )
     onnx.checker.check_model(onnx_model)
     onnx.save(onnx_model, str(destination))
+    write_input_schema(model_schema_sidecar_path(destination), input_schema)
 
     with torch.no_grad():
         torch_logits = model(verify_input).numpy()
@@ -87,10 +116,14 @@ def export_model(weights: str | Path, output: str | Path, *, verify_atol: float 
         )
 
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "onnx": str(destination),
         "onnx_sha256": sha256_file(destination),
         "checkpoint_sha256": sha256_file(weights),
+        "input_schema": str(model_schema_sidecar_path(destination)),
+        "input_schema_sha256": schema_hash,
+        "input_band_ids": [band["id"] for band in input_schema["tensor"]["bands"]],
+        "preprocessing_version": input_schema["preprocessing"]["version"],
         "bands": bands,
         "size": size,
         "base": base,
