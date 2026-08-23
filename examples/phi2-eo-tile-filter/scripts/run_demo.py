@@ -19,6 +19,21 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--train-fraction", type=float, default=0.60)
+    parser.add_argument("--calib-fraction", type=float, default=0.15)
+    parser.add_argument("--validation-fraction", type=float, default=0.10)
+    parser.add_argument("--target-recall", type=float, default=0.95)
+    parser.add_argument("--min-confidence", type=float, default=0.60)
+    parser.add_argument("--calibration-confidence-level", type=float, default=0.95)
+    parser.add_argument("--min-calibration-recall-lower-bound", type=float, default=None)
+    parser.add_argument("--max-accuracy-drop", type=float, default=0.05)
+    parser.add_argument("--min-argmax-agreement", type=float, default=0.95)
+    parser.add_argument("--max-event-recall-drop", type=float, default=0.05)
+    parser.add_argument("--max-event-fnr-increase", type=float, default=0.05)
+    parser.add_argument("--max-pr-auc-drop", type=float, default=0.05)
+    parser.add_argument("--min-policy-decision-agreement", type=float, default=0.95)
+    parser.add_argument("--max-event-retention-recall-drop", type=float, default=0.05)
+    parser.add_argument("--max-event-score-drift", type=float, default=0.05)
     parser.add_argument("--output-root", type=Path, default=Path("."))
     args = parser.parse_args()
 
@@ -56,6 +71,12 @@ def main() -> None:
             str(args.size),
             "--seed",
             str(args.seed),
+            "--train-fraction",
+            str(args.train_fraction),
+            "--calib-fraction",
+            str(args.calib_fraction),
+            "--validation-fraction",
+            str(args.validation_fraction),
             "--overwrite",
         ],
         cwd=example_root,
@@ -102,6 +123,30 @@ def main() -> None:
         ],
         cwd=example_root,
     )
+
+    calibration_command = [
+        python,
+        "-m",
+        "phi2_tile_filter.calibrate_threshold",
+        "--onnx",
+        str(models / "tinycnn_int8.onnx"),
+        "--data",
+        str(tiles / "calib"),
+        "--target-recall",
+        str(args.target_recall),
+        "--min-confidence",
+        str(args.min_confidence),
+        "--confidence-level",
+        str(args.calibration_confidence_level),
+        "--out",
+        str(calibration),
+    ]
+    if args.min_calibration_recall_lower_bound is not None:
+        calibration_command.extend(
+            ["--min-event-recall-lower-bound", str(args.min_calibration_recall_lower_bound)]
+        )
+    run(calibration_command, cwd=example_root)
+
     run(
         [
             python,
@@ -112,31 +157,27 @@ def main() -> None:
             "--int8",
             str(models / "tinycnn_int8.onnx"),
             "--data",
-            str(tiles / "test"),
+            str(tiles / "validation"),
+            "--policy",
+            str(calibration),
             "--max-accuracy-drop",
-            "0.05",
+            str(args.max_accuracy_drop),
             "--min-argmax-agreement",
-            "0.95",
+            str(args.min_argmax_agreement),
+            "--max-event-recall-drop",
+            str(args.max_event_recall_drop),
+            "--max-event-fnr-increase",
+            str(args.max_event_fnr_increase),
+            "--max-pr-auc-drop",
+            str(args.max_pr_auc_drop),
+            "--min-policy-decision-agreement",
+            str(args.min_policy_decision_agreement),
+            "--max-event-retention-recall-drop",
+            str(args.max_event_retention_recall_drop),
+            "--max-event-score-drift",
+            str(args.max_event_score_drift),
             "--out",
             str(reports / "model_validation.json"),
-        ],
-        cwd=example_root,
-    )
-    run(
-        [
-            python,
-            "-m",
-            "phi2_tile_filter.calibrate_threshold",
-            "--onnx",
-            str(models / "tinycnn_int8.onnx"),
-            "--data",
-            str(tiles / "calib"),
-            "--target-recall",
-            "0.95",
-            "--min-confidence",
-            "0.60",
-            "--out",
-            str(calibration),
         ],
         cwd=example_root,
     )
@@ -175,6 +216,8 @@ def main() -> None:
     active_model = Path(active["model"])
     active_policy = Path(active["policy"])
 
+    # The final test split is touched only after the candidate has passed calibration,
+    # validation, bundle verification, and promotion.
     run(
         [
             python,
@@ -224,9 +267,30 @@ def main() -> None:
         cwd=repo_root,
     )
 
-    metrics = json.loads((reports / "metrics.json").read_text(encoding="utf-8"))
-    metrics["active_bundle_id"] = active["bundle_id"]
-    print(json.dumps(metrics, indent=2, sort_keys=True))
+    manifest = json.loads((tiles / "manifest.json").read_text(encoding="utf-8"))
+    calibration_result = json.loads(active_policy.read_text(encoding="utf-8"))
+    validation_result = json.loads((reports / "model_validation.json").read_text(encoding="utf-8"))
+    final_test_metrics = json.loads((reports / "metrics.json").read_text(encoding="utf-8"))
+    result = {
+        "active_bundle_id": active["bundle_id"],
+        "split_counts": manifest["split_counts"],
+        "split_roles": manifest["split_roles"],
+        "calibration_statistics": calibration_result["calibration_statistics"],
+        "calibration_acceptance": calibration_result["calibration_acceptance"],
+        "validation_acceptance": {
+            "accepted": validation_result["accepted"],
+            "acceptance_checks": validation_result["acceptance_checks"],
+            "classification_quantization_regression": validation_result["classification_metrics"][
+                "quantization_regression"
+            ],
+            "policy_quantization_regression": validation_result["policy_metrics"][
+                "quantization_regression"
+            ],
+            "score_drift_metrics": validation_result["score_drift_metrics"],
+        },
+        "final_test_metrics": final_test_metrics,
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

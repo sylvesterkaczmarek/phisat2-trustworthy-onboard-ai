@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from phi2_tile_filter.synth import write_dataset
-from phi2_tile_filter.utils import TileFolder, load_tile_numpy, read_dataset_manifest
+from phi2_tile_filter.synth import SPLITS, write_dataset
+from phi2_tile_filter.utils import TileFolder, load_tile_numpy, read_dataset_manifest, sha256_file
 
 
 def _tree_hash(root: Path) -> str:
@@ -21,19 +21,30 @@ def _tree_hash(root: Path) -> str:
 def test_synthetic_dataset_is_deterministic(tmp_path: Path) -> None:
     first = tmp_path / "a"
     second = tmp_path / "b"
-    write_dataset(first, n=60, bands=7, size=24, seed=11)
-    write_dataset(second, n=60, bands=7, size=24, seed=11)
+    write_dataset(first, n=80, bands=7, size=24, seed=11)
+    write_dataset(second, n=80, bands=7, size=24, seed=11)
     assert _tree_hash(first) == _tree_hash(second)
 
 
-def test_train_calib_test_are_separate_and_balanced(tmp_path: Path) -> None:
+def test_four_way_lifecycle_is_separate_and_has_no_duplicate_tiles(tmp_path: Path) -> None:
     root = tmp_path / "tiles"
     manifest = write_dataset(root, n=80, bands=3, size=20, seed=0)
-    assert set(manifest["split_counts"]) == {"train", "calib", "test"}
-    for split in ("train", "calib", "test"):
+    assert manifest["schema_version"] == 2
+    assert tuple(manifest["split_counts"]) == SPLITS
+    assert set(manifest["split_roles"]) == {"train", "calib", "validation", "test"}
+    assert manifest["split_roles"]["test"] == "final_report_only"
+
+    all_hashes: set[str] = set()
+    for split in SPLITS:
         dataset = TileFolder(root / split, bands=3, size=20)
         labels = [int(dataset[index][1]) for index in range(len(dataset))]
         assert 0 in labels and 1 in labels
+        split_hashes = {
+            sha256_file(path)
+            for path in (root / split).rglob("*.npy")
+        }
+        assert split_hashes.isdisjoint(all_hashes)
+        all_hashes.update(split_hashes)
 
 
 def test_multispectral_npy_round_trip(tmp_path: Path) -> None:

@@ -12,12 +12,16 @@ from .utils import discover_tile_files
 
 def load_policy(path: str | Path, runner: OnnxRunner) -> DecisionPolicy:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 2:
+    if payload.get("schema_version") not in (2, 3):
         raise ValueError("unsupported calibration policy schema")
     if payload.get("model_sha256") != runner.model_sha256:
         raise ValueError("calibration policy belongs to a different model")
     if int(payload.get("bands", -1)) != runner.spec.bands or int(payload.get("size", -1)) != runner.spec.size:
         raise ValueError("calibration policy input shape does not match model")
+    if payload.get("schema_version") == 3:
+        acceptance = payload.get("calibration_acceptance")
+        if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
+            raise ValueError("calibration policy is not marked accepted")
     return DecisionPolicy(
         event_threshold=float(payload["event_threshold"]),
         min_confidence=float(payload["min_confidence"]),

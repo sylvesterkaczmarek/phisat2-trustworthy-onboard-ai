@@ -174,8 +174,14 @@ def read_dataset_manifest(root: str | Path) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"dataset manifest not found: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") not in (1, 2):
         raise ValueError("unsupported dataset manifest schema")
+    if payload.get("schema_version") == 2:
+        expected_roles = {"train", "calib", "validation", "test"}
+        if set(payload.get("split_counts", {})) != expected_roles:
+            raise ValueError("four-way dataset manifest is missing a required split")
+        if set(payload.get("split_roles", {})) != expected_roles:
+            raise ValueError("four-way dataset manifest is missing split-role metadata")
     return payload
 
 

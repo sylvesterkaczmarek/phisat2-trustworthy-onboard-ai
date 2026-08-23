@@ -17,29 +17,33 @@ flowchart LR
     A[Train split] --> B[TinyCNN]
     B --> C[FP32 ONNX]
     C --> D[INT8 QDQ]
-    D --> G[Held-out model validation]
-    E[Calibration split] --> F[Event threshold and temperature]
+    E[Calibration split] --> F[Threshold, temperature, recall bound]
     D --> F
+    V[Validation split] --> G[Quantization and policy acceptance]
+    C --> G
+    D --> G
+    F --> G
     D --> K[Deployment bundle]
     F --> K
     G --> K
     K --> L[Atomic active bundle pointer]
-    I[Test split] --> H[Downlink policy]
+    T[Final test split] --> H[Final downlink evaluation]
     L --> H
-    H --> J[Telemetry and report]
+    H --> J[Telemetry and final report]
 ```
 
-The design separates model training, policy calibration, validation, deployment, and final evaluation. A deployable configuration is an immutable bundle that cryptographically binds the ONNX model to its calibration policy, preprocessing metadata, and validation evidence.
+The design uses four independent data roles: training fits model parameters, calibration selects the INT8 calibration and decision policy, validation decides whether the quantized candidate is acceptable, and the final test is used only after deployment acceptance. A deployable configuration is an immutable bundle that cryptographically binds the ONNX model to its calibration policy, preprocessing metadata, and validation evidence.
 
 ## What is implemented
 
-- deterministic synthetic EO data generation with independent `train`, `calib`, and `test` splits
+- deterministic synthetic EO data generation with independent `train`, `calib`, `validation`, and final `test` splits
 - arbitrary multispectral band counts through NumPy tile stacks
 - deterministic TinyCNN training with architecture metadata stored in the checkpoint
 - PyTorch to FP32 ONNX export with ONNX validation and numerical equivalence check
 - static QDQ INT8 quantization with calibration data kept separate from final test data
-- held-out FP32 versus INT8 accuracy and prediction-agreement regression checks
-- calibrated event threshold targeting a requested event recall
+- validation-only FP32 versus INT8 gates for accuracy, event recall/FNR, F1, PR-AUC, score drift, argmax agreement, and calibrated retain/discard decisions
+- calibrated event threshold with empirical recall and a one-sided exact Clopper-Pearson lower confidence bound
+- optional acceptance gate on the calibration recall lower bound
 - optional deterministic temperature scaling on the calibration split
 - conservative fallback that downlinks low-confidence tiles and inference failures
 - deployment bundles containing model, policy, preprocessing/input schema, validation evidence, and hashes
@@ -94,7 +98,7 @@ reports/summary.md
 
 Each stored bundle contains `model.onnx`, `policy.json`, `input_schema.json`, `validation.json`, and `bundle.json`. The deployment-state file names the active and previous bundle by content-derived bundle ID.
 
-The report uses held-out test telemetry for precision, recall, AUC, latency, fallback count, event capture, and exact byte-level bandwidth savings. Calibration metrics are kept separate from test metrics.
+The final report is generated only from the reserved test split after the candidate bundle has passed calibration and validation. Metric namespaces distinguish final-test model classification, calibration-policy evidence, final-test downlink retention, and runtime measurements. The requested calibration recall is explicitly a threshold-selection target, not a claimed population guarantee.
 
 ## Validation gates
 
@@ -104,14 +108,16 @@ The pipeline fails rather than silently continuing when:
 - PyTorch and FP32 ONNX outputs exceed the configured numerical tolerance
 - ONNX structural validation fails
 - the quantized artifact lacks the expected QDQ operators
-- held-out INT8 accuracy degrades beyond the allowed threshold
-- FP32 and INT8 prediction agreement falls below the required level
+- validation-split INT8 accuracy, event recall/FNR, PR-AUC, or calibrated retention behaviour regresses beyond configured limits
+- FP32 and INT8 argmax or retain/discard agreement falls below configured limits
+- event-score drift exceeds its configured validation limit
+- an optional calibration recall lower-bound requirement is not met
 - a calibration file belongs to a different model hash or input shape
-- the validation report does not cover the exact candidate INT8 model
+- the validation report does not cover the exact candidate INT8 model or is not explicitly from the validation split
 - any bundle component is missing or has a mismatched SHA-256
 - the bundle manifest or deployment state is inconsistent
 
-The active deployment is changed only after validation, calibration, bundle construction, and bundle verification have completed successfully.
+The active deployment is changed only after calibration, validation-only acceptance, bundle construction, and bundle verification have completed successfully. The final test split is not used to decide whether the candidate is accepted.
 
 ## Deployment bundle handling
 
@@ -165,11 +171,11 @@ The deployment bundle records the current demo input contract, including layout,
 
 ## Reproducibility
 
-See [docs/reproducibility.md](docs/reproducibility.md). Training seeds Python, NumPy, PyTorch, and DataLoader shuffling. CI performs the end-to-end pipeline using a seven-band synthetic dataset so multispectral support and deployment-bundle handling cannot regress unnoticed.
+See [docs/reproducibility.md](docs/reproducibility.md). Training seeds Python, NumPy, PyTorch, and DataLoader shuffling. The dataset manifest records all four split roles and independent RNG child streams. CI performs the end-to-end pipeline using a seven-band synthetic dataset and checks that validation and final-test reporting use different partitions.
 
 ## What this repository does not claim
 
-This repository is a software and assurance demonstrator. The synthetic benchmark is deliberately simple. It does not establish PhiSat-2 performance, flight readiness, radiation tolerance, worst-case execution time, hardware qualification, operational EO accuracy, formal safety, or mission-level fault tolerance.
+This repository is a software and assurance demonstrator. The synthetic benchmark is deliberately simple. Clopper-Pearson bounds quantify sampling uncertainty under a binomial model but do not establish mission-level recall under distribution shift. The repository does not establish PhiSat-2 performance, flight readiness, radiation tolerance, worst-case execution time, hardware qualification, operational EO accuracy, formal safety, or mission-level fault tolerance.
 
 The watchdog and deployment helpers are process-level examples rather than flight-qualified FDIR. Real onboard deployment would also require representative sensor data, hardware-in-the-loop validation, resource and thermal limits, platform-specific persistent storage guarantees, signed model/update handling, fault injection, and mission-specific acceptance criteria.
 

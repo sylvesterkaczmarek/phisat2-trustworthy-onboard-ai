@@ -122,7 +122,7 @@ def _onnx_input_spec(path: Path) -> tuple[int, int]:
 
 
 def _validate_policy(policy: dict[str, Any], *, model_sha256: str, bands: int, size: int) -> None:
-    if policy.get("schema_version") != 2:
+    if policy.get("schema_version") not in (2, 3):
         raise ValueError("unsupported calibration policy schema")
     if policy.get("model_sha256") != model_sha256:
         raise ValueError("calibration policy belongs to a different model")
@@ -141,25 +141,102 @@ def _validate_policy(policy: dict[str, Any], *, model_sha256: str, bands: int, s
         elif not 0.0 <= value <= 1.0:
             raise ValueError(f"calibration policy {key} must be in [0, 1]")
 
+    if policy.get("schema_version") == 3:
+        if policy.get("split_role") != "calibration":
+            raise ValueError("calibration policy does not identify the calibration split role")
+        statistics = policy.get("calibration_statistics")
+        acceptance = policy.get("calibration_acceptance")
+        if not isinstance(statistics, dict) or not isinstance(acceptance, dict):
+            raise ValueError("calibration policy is missing statistical assurance metadata")
+        try:
+            lower = float(statistics["event_recall_lower_bound"])
+            confidence = float(statistics["event_recall_confidence_level"])
+            empirical = float(statistics["empirical_event_recall"])
+            event_samples = int(statistics["event_samples"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("calibration policy has invalid recall-bound metadata") from exc
+        if not 0.0 <= lower <= empirical <= 1.0 or not 0.0 < confidence < 1.0 or event_samples <= 0:
+            raise ValueError("calibration policy recall-bound metadata is inconsistent")
+        if statistics.get("event_recall_bound_method") != "clopper-pearson-one-sided-exact":
+            raise ValueError("calibration policy uses an unsupported recall-bound method")
+        if acceptance.get("accepted") is not True:
+            raise ValueError("calibration policy is not marked accepted")
+        required = acceptance.get("required_min_event_recall_lower_bound")
+        if required is not None and lower < float(required):
+            raise ValueError("calibration policy does not meet its recall lower-bound requirement")
+
 
 def _validate_validation_report(report: dict[str, Any], *, model_sha256: str) -> None:
-    if report.get("schema_version") != 1:
+    schema_version = report.get("schema_version")
+    if schema_version == 1:
+        if report.get("int8_sha256") != model_sha256:
+            raise ValueError("validation report does not cover the candidate model")
+        try:
+            drop = float(report["accuracy_drop"])
+            max_drop = float(report["max_accuracy_drop_allowed"])
+            agreement = float(report["argmax_agreement"])
+            min_agreement = float(report["min_argmax_agreement_required"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("validation report is missing required acceptance metrics") from exc
+        if drop > max_drop:
+            raise ValueError("validation report records an unacceptable INT8 accuracy drop")
+        if agreement < min_agreement:
+            raise ValueError("validation report records unacceptable FP32/INT8 agreement")
+        if "accepted" in report and report["accepted"] is not True:
+            raise ValueError("validation report is not marked accepted")
+        return
+
+    if schema_version != 2:
         raise ValueError("unsupported validation report schema")
+    if report.get("split_role") != "validation":
+        raise ValueError("model acceptance report must come from the validation split")
     if report.get("int8_sha256") != model_sha256:
         raise ValueError("validation report does not cover the candidate model")
-    try:
-        drop = float(report["accuracy_drop"])
-        max_drop = float(report["max_accuracy_drop_allowed"])
-        agreement = float(report["argmax_agreement"])
-        min_agreement = float(report["min_argmax_agreement_required"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("validation report is missing required acceptance metrics") from exc
-    if drop > max_drop:
-        raise ValueError("validation report records an unacceptable INT8 accuracy drop")
-    if agreement < min_agreement:
-        raise ValueError("validation report records unacceptable FP32/INT8 agreement")
-    if "accepted" in report and report["accepted"] is not True:
+    if report.get("accepted") is not True:
         raise ValueError("validation report is not marked accepted")
+
+    try:
+        classification = report["classification_metrics"]["quantization_regression"]
+        policy = report["policy_metrics"]["quantization_regression"]
+        drift = report["score_drift_metrics"]
+        criteria = report["acceptance_criteria"]
+        reported_checks = report["acceptance_checks"]
+        expected_checks = {
+            "classification_accuracy_drop": (
+                float(classification["accuracy_drop"]) <= float(criteria["max_classification_accuracy_drop"])
+            ),
+            "classification_argmax_agreement": (
+                float(classification["argmax_agreement"]) >= float(criteria["min_classification_argmax_agreement"])
+            ),
+            "classification_event_recall_drop": (
+                float(classification["event_recall_drop"])
+                <= float(criteria["max_classification_event_recall_drop"])
+            ),
+            "classification_event_false_negative_rate_increase": (
+                float(classification["event_false_negative_rate_increase"])
+                <= float(criteria["max_classification_event_false_negative_rate_increase"])
+            ),
+            "classification_pr_auc_drop": (
+                float(classification["pr_auc_drop"]) <= float(criteria["max_classification_pr_auc_drop"])
+            ),
+            "policy_retention_decision_agreement": (
+                float(policy["retention_decision_agreement"])
+                >= float(criteria["min_policy_retention_decision_agreement"])
+            ),
+            "policy_event_retention_recall_drop": (
+                float(policy["event_retention_recall_drop"])
+                <= float(criteria["max_policy_event_retention_recall_drop"])
+            ),
+            "event_score_drift": (
+                float(drift["max_absolute_event_score_drift"]) <= float(criteria["max_event_score_drift"])
+            ),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("validation report is missing required scientific acceptance metrics") from exc
+    if not isinstance(reported_checks, dict) or reported_checks != expected_checks:
+        raise ValueError("validation report acceptance checks do not match its recorded metrics")
+    if not all(expected_checks.values()):
+        raise ValueError("validation report records failed scientific acceptance criteria")
 
 
 def _input_schema_payload(*, model_sha256: str, bands: int, size: int) -> dict[str, Any]:
