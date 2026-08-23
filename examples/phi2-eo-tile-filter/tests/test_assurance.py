@@ -43,6 +43,63 @@ def _write_test_model(path: Path, marker: str, *, bands: int = 3, size: int = 8)
     onnx.save(model, path)
 
 
+def _valid_validation_payload(model_hash: str) -> dict:
+    checks = {
+        "classification_accuracy_drop": True,
+        "classification_argmax_agreement": True,
+        "classification_event_recall_drop": True,
+        "classification_event_false_negative_rate_increase": True,
+        "classification_pr_auc_drop": True,
+        "policy_retention_decision_agreement": True,
+        "policy_event_retention_recall_drop": True,
+        "event_score_drift": True,
+    }
+    return {
+        "schema_version": 2,
+        "split_role": "validation",
+        "validation_samples": 20,
+        "validation_event_samples": 10,
+        "validation_background_samples": 10,
+        "fp32_sha256": "b" * 64,
+        "int8_sha256": model_hash,
+        "classification_metrics": {
+            "quantization_regression": {
+                "accuracy_drop": 0.0,
+                "event_recall_drop": 0.0,
+                "event_false_negative_rate_increase": 0.0,
+                "event_f1_drop": 0.0,
+                "roc_auc_drop": 0.0,
+                "pr_auc_drop": 0.0,
+                "argmax_agreement": 1.0,
+            }
+        },
+        "policy_metrics": {
+            "quantization_regression": {
+                "retention_decision_agreement": 1.0,
+                "event_retention_recall_drop": 0.0,
+                "retained_fraction_change": 0.0,
+            }
+        },
+        "score_drift_metrics": {
+            "mean_absolute_event_score_drift": 0.0,
+            "p95_absolute_event_score_drift": 0.0,
+            "max_absolute_event_score_drift": 0.0,
+        },
+        "acceptance_criteria": {
+            "max_classification_accuracy_drop": 0.02,
+            "min_classification_argmax_agreement": 0.98,
+            "max_classification_event_recall_drop": 0.02,
+            "max_classification_event_false_negative_rate_increase": 0.02,
+            "max_classification_pr_auc_drop": 0.02,
+            "min_policy_retention_decision_agreement": 0.98,
+            "max_policy_event_retention_recall_drop": 0.02,
+            "max_event_score_drift": 0.05,
+        },
+        "acceptance_checks": checks,
+        "accepted": True,
+    }
+
+
 def _write_candidate_artifacts(root: Path, marker: str) -> tuple[Path, Path, Path]:
     root.mkdir(parents=True, exist_ok=True)
     model = root / "model.onnx"
@@ -52,30 +109,37 @@ def _write_candidate_artifacts(root: Path, marker: str) -> tuple[Path, Path, Pat
     policy.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
+                "split_role": "calibration",
                 "model_sha256": model_hash,
                 "bands": 3,
                 "size": 8,
                 "event_threshold": 0.8,
                 "min_confidence": 0.6,
                 "temperature": 1.0,
+                "temperature_fitted": True,
+                "calibration_statistics": {
+                    "samples_total": 20,
+                    "event_samples": 10,
+                    "background_samples": 10,
+                    "target_event_recall_for_threshold_selection": 0.95,
+                    "empirical_event_recall": 1.0,
+                    "event_captures": 10,
+                    "event_precision_at_threshold": 1.0,
+                    "roc_auc": 1.0,
+                    "event_recall_lower_bound": 0.74,
+                    "event_recall_confidence_level": 0.95,
+                    "event_recall_bound_method": "clopper-pearson-one-sided-exact",
+                },
+                "calibration_acceptance": {
+                    "required_min_event_recall_lower_bound": None,
+                    "accepted": True,
+                },
             }
         )
     )
     validation = root / "validation.json"
-    validation.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "int8_sha256": model_hash,
-                "accuracy_drop": 0.0,
-                "argmax_agreement": 1.0,
-                "max_accuracy_drop_allowed": 0.02,
-                "min_argmax_agreement_required": 0.98,
-                "accepted": True,
-            }
-        )
-    )
+    validation.write_text(json.dumps(_valid_validation_payload(model_hash)))
     return model, policy, validation
 
 
@@ -126,14 +190,33 @@ def test_bundle_rejects_validation_report_hash_mismatch(tmp_path: Path) -> None:
         build_bundle(model, policy, validation, tmp_path / "bundle")
 
 
+def test_bundle_rejects_test_set_as_acceptance_evidence(tmp_path: Path) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "wrong-split")
+    payload = json.loads(validation.read_text())
+    payload["split_role"] = "final_test"
+    validation.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="validation split"):
+        build_bundle(model, policy, validation, tmp_path / "bundle")
+
+
+def test_bundle_recomputes_scientific_validation_checks(tmp_path: Path) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "tampered-validation")
+    payload = json.loads(validation.read_text())
+    payload["classification_metrics"]["quantization_regression"]["event_recall_drop"] = 0.5
+    validation.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="acceptance checks do not match"):
+        build_bundle(model, policy, validation, tmp_path / "bundle")
+
+
 def test_failed_calibration_cannot_be_promoted(tmp_path: Path) -> None:
     model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "failed-calibration")
     payload = json.loads(policy.read_text())
-    payload.pop("event_threshold")
+    payload["calibration_acceptance"]["required_min_event_recall_lower_bound"] = 0.9
+    payload["calibration_acceptance"]["accepted"] = False
     policy.write_text(json.dumps(payload))
     bundle = tmp_path / "bundle"
     state = tmp_path / "deployment_state.json"
-    with pytest.raises(ValueError, match="missing event_threshold"):
+    with pytest.raises(ValueError, match="not marked accepted"):
         build_bundle(model, policy, validation, bundle)
     assert not bundle.exists()
     assert not state.exists()
@@ -179,7 +262,7 @@ def test_watchdog_does_not_need_shell(tmp_path: Path) -> None:
     assert rc == 0
 
 
-def test_summarizer_uses_kept_and_bytes(tmp_path: Path) -> None:
+def test_summarizer_separates_final_test_model_and_downlink_metrics(tmp_path: Path) -> None:
     model_hash = "a" * 64
     test_records = [
         {"file": "background/0.npy", "model_sha256": model_hash, "true_class": 0, "pred_class": 0, "prob_event": 0.1, "inference_ok": True, "latency_ms": 1.0},
@@ -196,10 +279,37 @@ def test_summarizer_uses_kept_and_bytes(tmp_path: Path) -> None:
     test_log.write_text("".join(json.dumps(r) + "\n" for r in test_records))
     down_log.write_text("".join(json.dumps(r) + "\n" for r in down_records))
     calib = tmp_path / "calib.json"
-    calib.write_text(json.dumps({"model_sha256": model_hash, "target_event_recall": 0.95, "event_threshold": 0.8, "min_confidence": 0.6, "temperature": 1.0}))
+    calib.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "model_sha256": model_hash,
+                "event_threshold": 0.8,
+                "min_confidence": 0.6,
+                "temperature": 1.0,
+                "calibration_statistics": {
+                    "samples_total": 20,
+                    "event_samples": 10,
+                    "target_event_recall_for_threshold_selection": 0.95,
+                    "empirical_event_recall": 1.0,
+                    "event_recall_lower_bound": 0.74,
+                    "event_recall_confidence_level": 0.95,
+                    "event_recall_bound_method": "clopper-pearson-one-sided-exact",
+                },
+                "calibration_acceptance": {
+                    "required_min_event_recall_lower_bound": None,
+                    "accepted": True,
+                },
+            }
+        )
+    )
     metrics = summarize(test_log, down_log, calib)
-    assert metrics["tiles_kept"] == 2
-    assert metrics["bytes_kept"] == 500
-    assert metrics["bandwidth_saved_pct"] == pytest.approx(100.0 / 6.0)
-    assert metrics["downlink_event_recall"] == 1.0
-    assert metrics["fallback_tiles"] == 1
+    assert metrics["split_role"] == "final_test"
+    downlink = metrics["final_test_downlink_retention_metrics"]
+    model = metrics["final_test_model_classification_metrics"]
+    assert downlink["tiles_kept"] == 2
+    assert downlink["bytes_kept"] == 500
+    assert downlink["downlink_bytes_saved_pct"] == pytest.approx(100.0 / 6.0)
+    assert downlink["event_retention_recall"] == 1.0
+    assert model["event_recall"] == 0.5
+    assert metrics["calibration_policy_metadata"]["calibration_event_recall_lower_bound"] == 0.74

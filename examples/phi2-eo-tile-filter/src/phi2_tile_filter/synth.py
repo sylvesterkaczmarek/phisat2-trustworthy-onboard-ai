@@ -7,8 +7,14 @@ from pathlib import Path
 
 import numpy as np
 
-SPLITS = ("train", "calib", "test")
+SPLITS = ("train", "calib", "validation", "test")
 CLASSES = ("background", "event")
+SPLIT_ROLES = {
+    "train": "model_parameter_fitting",
+    "calib": "quantization_and_policy_calibration",
+    "validation": "model_and_quantization_acceptance",
+    "test": "final_report_only",
+}
 
 
 def make_tile(rng: np.random.Generator, size: int, bands: int, cls: int) -> np.ndarray:
@@ -25,28 +31,33 @@ def make_tile(rng: np.random.Generator, size: int, bands: int, cls: int) -> np.n
     return image
 
 
-def split_counts(total: int, train_fraction: float, calib_fraction: float) -> dict[str, int]:
-    if total < 12:
-        raise ValueError("n must be at least 12 so every split has both classes")
-    if not (0.0 < train_fraction < 1.0 and 0.0 < calib_fraction < 1.0):
-        raise ValueError("split fractions must be between 0 and 1")
-    if train_fraction + calib_fraction >= 1.0:
-        raise ValueError("train_fraction + calib_fraction must be < 1")
-    train = max(2, int(round(total * train_fraction)))
-    calib = max(2, int(round(total * calib_fraction)))
-    test = total - train - calib
-    if test < 2:
+def split_counts(
+    total: int,
+    train_fraction: float,
+    calib_fraction: float,
+    validation_fraction: float = 0.10,
+) -> dict[str, int]:
+    if total < 16:
+        raise ValueError("n must be at least 16 for four non-empty class-balanced-capable splits")
+    fractions = {
+        "train": train_fraction,
+        "calib": calib_fraction,
+        "validation": validation_fraction,
+    }
+    if any(not 0.0 < value < 1.0 for value in fractions.values()):
+        raise ValueError("train, calibration, and validation fractions must be between 0 and 1")
+    if sum(fractions.values()) >= 1.0:
+        raise ValueError("train_fraction + calib_fraction + validation_fraction must be < 1")
+
+    counts = {
+        name: max(2, int(round(total * fraction)))
+        for name, fraction in fractions.items()
+    }
+    counts["test"] = total - sum(counts.values())
+    if counts["test"] < 2:
         raise ValueError("test split would contain fewer than two samples")
-    counts = {"train": train, "calib": calib, "test": test}
-    for key in ("train", "calib"):
-        if counts[key] % 2:
-            counts[key] -= 1
-            counts["test"] += 1
-    if counts["test"] % 2:
-        counts["test"] -= 1
-        counts["train"] += 1
-    if min(counts.values()) < 2:
-        raise ValueError("each split must contain at least two samples")
+    if min(counts.values()) < 2 or sum(counts.values()) != total:
+        raise ValueError("invalid four-way split allocation")
     return counts
 
 
@@ -57,12 +68,13 @@ def write_dataset(
     bands: int,
     size: int,
     seed: int,
-    train_fraction: float = 0.70,
+    train_fraction: float = 0.60,
     calib_fraction: float = 0.15,
+    validation_fraction: float = 0.10,
     overwrite: bool = False,
 ) -> dict:
     root = Path(root)
-    counts = split_counts(n, train_fraction, calib_fraction)
+    counts = split_counts(n, train_fraction, calib_fraction, validation_fraction)
     if root.exists():
         if not overwrite:
             raise FileExistsError(f"{root} already exists; pass --overwrite to replace it")
@@ -71,7 +83,9 @@ def write_dataset(
 
     seed_sequence = np.random.SeedSequence(seed)
     child_sequences = seed_sequence.spawn(len(SPLITS))
+    split_seed_spawn_keys: dict[str, list[int]] = {}
     for split, split_seed in zip(SPLITS, child_sequences):
+        split_seed_spawn_keys[split] = [int(value) for value in split_seed.spawn_key]
         rng = np.random.default_rng(split_seed)
         count = counts[split]
         labels = np.array([i % 2 for i in range(count)], dtype=np.int64)
@@ -87,14 +101,22 @@ def write_dataset(
             np.save(destination, tile, allow_pickle=False)
 
     manifest = {
-        "schema_version": 1,
-        "generator": "synthetic-square-event-v2",
+        "schema_version": 2,
+        "generator": "synthetic-square-event-v3-four-way",
         "seed": int(seed),
         "samples": int(sum(counts.values())),
         "bands": int(bands),
         "size": int(size),
         "class_names": list(CLASSES),
         "split_counts": counts,
+        "split_roles": SPLIT_ROLES,
+        "split_seed_spawn_keys": split_seed_spawn_keys,
+        "split_fractions_requested": {
+            "train": float(train_fraction),
+            "calib": float(calib_fraction),
+            "validation": float(validation_fraction),
+            "test": float(1.0 - train_fraction - calib_fraction - validation_fraction),
+        },
         "tile_format": "npy-float32-hwc-0to1",
     }
     (root / "manifest.json").write_text(
@@ -110,8 +132,9 @@ def main() -> None:
     parser.add_argument("--bands", type=int, default=3)
     parser.add_argument("--size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--train-fraction", type=float, default=0.70)
+    parser.add_argument("--train-fraction", type=float, default=0.60)
     parser.add_argument("--calib-fraction", type=float, default=0.15)
+    parser.add_argument("--validation-fraction", type=float, default=0.10)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     manifest = write_dataset(
@@ -122,6 +145,7 @@ def main() -> None:
         seed=args.seed,
         train_fraction=args.train_fraction,
         calib_fraction=args.calib_fraction,
+        validation_fraction=args.validation_fraction,
         overwrite=args.overwrite,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
