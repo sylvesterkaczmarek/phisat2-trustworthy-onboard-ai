@@ -41,11 +41,17 @@ def main() -> None:
 
     example_root = Path(__file__).resolve().parents[1]
     repo_root = example_root.parents[1]
+    example_src = example_root / "src"
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from assurance.model_store import resolve_bundle
+    if str(example_src) not in sys.path:
+        sys.path.insert(0, str(example_src))
 
-    output_root = args.output_root.resolve()
+    from assurance.model_store import resolve_bundle
+    from phi2_tile_filter.filesystem import assert_safe_workspace_root
+    from phi2_tile_filter.provenance import collect_run_environment, write_run_environment
+
+    output_root = assert_safe_workspace_root(args.output_root.resolve(), operation="demo output")
     tiles = output_root / "tiles"
     runs = output_root / "runs"
     models = output_root / "models"
@@ -223,8 +229,8 @@ def main() -> None:
     active_policy = Path(active["policy"])
     active_bundle_id = str(active["bundle_id"])
 
-    # The final test split is touched only after the candidate has passed calibration,
-    # validation, bundle verification, and promotion.
+    # The final test split is touched only after calibration, validation,
+    # bundle verification, and promotion have succeeded.
     run(
         [
             python,
@@ -283,6 +289,17 @@ def main() -> None:
     validation_result = json.loads((reports / "model_validation.json").read_text(encoding="utf-8"))
     final_test_metrics = json.loads((reports / "metrics.json").read_text(encoding="utf-8"))
     guard = calibration_result.get("input_quality_guard", {})
+
+    runtime_metrics = final_test_metrics.get("final_test_runtime_metrics", {})
+    environment = collect_run_environment(
+        repo_root,
+        seed=args.seed,
+        selected_execution_provider=runtime_metrics.get("execution_provider"),
+        run_parameters=vars(args),
+    )
+    environment_path = reports / "run_environment.json"
+    write_run_environment(environment_path, environment)
+
     result = {
         "active_bundle_id": active_bundle_id,
         "split_counts": manifest["split_counts"],
@@ -307,6 +324,14 @@ def main() -> None:
             "score_drift_metrics": validation_result["score_drift_metrics"],
         },
         "final_test_metrics": final_test_metrics,
+        "run_environment": {
+            "path": str(environment_path),
+            "git_commit_sha": environment["git"]["commit_sha"],
+            "git_dirty": environment["git"]["dirty"],
+            "dependency_fingerprint_sha256": environment["dependency_fingerprint_sha256"],
+            "environment_fingerprint_sha256": environment["environment_fingerprint_sha256"],
+            "reference_requirements_sha256": environment["reference_environment"]["sha256"],
+        },
     }
     print(json.dumps(result, indent=2, sort_keys=True))
 

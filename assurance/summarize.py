@@ -16,7 +16,6 @@ if str(EXAMPLE_SRC) not in sys.path:
 from phi2_tile_filter.telemetry import (  # noqa: E402
     DOWNLINK_RECORD_KIND,
     FINAL_TEST_RECORD_KIND,
-    TELEMETRY_RECORD_SCHEMA_VERSION,
     validate_telemetry_record,
 )
 from phi2_tile_filter.utils import sha256_file  # noqa: E402
@@ -139,6 +138,11 @@ def _verify_telemetry_integrity(
             raise ValueError(f"final-test/downlink {key} mismatch")
         identity[key] = test_value
 
+    test_record_version = _one_value(test, "schema_version")
+    down_record_version = _one_value(downlink, "schema_version")
+    if test_record_version != down_record_version:
+        raise ValueError("final-test/downlink telemetry schema version mismatch")
+
     test_bundle_verified = _one_value(test, "deployment_bundle_verified")
     down_bundle_verified = _one_value(downlink, "deployment_bundle_verified")
     if test_bundle_verified != down_bundle_verified:
@@ -167,8 +171,22 @@ def _verify_telemetry_integrity(
 
     identity["policy_artifact_sha256"] = calibration_hash
     identity["input_hashes_verified"] = True
-    identity["telemetry_record_schema_version"] = TELEMETRY_RECORD_SCHEMA_VERSION
+    identity["telemetry_record_schema_version"] = test_record_version
     return test_by_file, down_by_file, identity
+
+
+def _timing_summary(records: list[dict], key: str) -> dict:
+    values = [float(record[key]) for record in records if record.get(key) is not None]
+    if not values:
+        return {"samples": 0, "avg": None, "p50": None, "p95": None, "p99": None}
+    data = np.asarray(values, dtype=float)
+    return {
+        "samples": len(values),
+        "avg": float(np.mean(data)),
+        "p50": float(np.percentile(data, 50)),
+        "p95": float(np.percentile(data, 95)),
+        "p99": float(np.percentile(data, 99)),
+    }
 
 
 def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: str | Path) -> dict:
@@ -178,7 +196,7 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
     if not test or not downlink:
         raise ValueError("final-test and downlink logs must be non-empty")
 
-    test_by_file, down_by_file, identity = _verify_telemetry_integrity(
+    _, down_by_file, identity = _verify_telemetry_integrity(
         test,
         downlink,
         calibration,
@@ -220,11 +238,6 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
         for record in downlink
         if record["retained_for_downlink"]
     )
-    latencies = [
-        float(record["latency_ms"])
-        for record in successful
-        if record.get("latency_ms") is not None
-    ]
     materialization_failures = sum(
         bool(record["retention_requested"]) and not bool(record["retained_for_downlink"])
         for record in downlink
@@ -233,8 +246,12 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
     quality_fallback_count = sum(record["decision"] == "input_quality_fallback" for record in downlink)
     quality_guard_enabled = bool(_one_value(downlink, "input_quality_guard_enabled"))
 
+    record_version = identity["telemetry_record_schema_version"]
+    execution_provider = _one_value(test, "execution_provider") if int(record_version) >= 6 else None
+    timing_scope = _one_value(test, "timing_scope") if int(record_version) >= 6 else None
+
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "split_role": "final_test",
         "deployment_bundle_id": identity["deployment_bundle_id"],
         "model_sha256": identity["model_sha256"],
@@ -282,8 +299,15 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
             "operational_link_bandwidth_measured": False,
         },
         "final_test_runtime_metrics": {
-            "avg_inference_latency_ms": float(np.mean(latencies)) if latencies else None,
-            "p95_inference_latency_ms": float(np.percentile(latencies, 95)) if latencies else None,
+            "timing_scope": timing_scope,
+            "execution_provider": execution_provider,
+            "spacecraft_timing_measured": False,
+            "input_observation_latency_ms": _timing_summary(test, "input_observation_latency_ms"),
+            "preprocessing_latency_ms": _timing_summary(test, "preprocessing_latency_ms"),
+            "input_quality_latency_ms": _timing_summary(test, "input_quality_latency_ms"),
+            "onnx_inference_latency_ms": _timing_summary(test, "onnx_inference_latency_ms"),
+            "policy_latency_ms": _timing_summary(test, "policy_latency_ms"),
+            "end_to_end_tile_latency_ms": _timing_summary(test, "end_to_end_latency_ms"),
         },
     }
 

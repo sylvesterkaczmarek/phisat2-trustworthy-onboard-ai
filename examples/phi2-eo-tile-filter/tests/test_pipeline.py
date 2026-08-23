@@ -59,6 +59,8 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     metrics = json.loads((output / "reports" / "metrics.json").read_text())
     validation = json.loads((output / "reports" / "model_validation.json").read_text())
     robustness = json.loads((output / "reports" / "robustness_benchmark.json").read_text())
+    run_environment = json.loads((output / "reports" / "run_environment.json").read_text())
+    robustness_environment = json.loads((output / "reports" / "robustness_environment.json").read_text())
     state = json.loads((output / "models" / "deployment_state.json").read_text())
     active_bundle = output / "models" / "bundles" / state["active_bundle_id"]
     bundle_manifest = json.loads((active_bundle / "bundle.json").read_text())
@@ -71,7 +73,7 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert manifest["input_schema_sha256"] == source_schema_hash
     assert manifest["input_band_ids"] == [f"band_{index:02d}" for index in range(1, 8)]
 
-    assert metrics["schema_version"] == 6
+    assert metrics["schema_version"] == 7
     assert metrics["split_role"] == "final_test"
     assert metrics["input_schema_sha256"] == source_schema_hash
     assert metrics["final_test_sample_counts"]["samples_total"] == manifest["split_counts"]["test"]
@@ -80,6 +82,23 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert 0.0 <= retention["source_bytes_reduction_pct"] <= 100.0
     assert retention["operational_link_bandwidth_measured"] is False
     assert metrics["final_test_input_quality_metrics"]["guard_enabled"] is True
+
+    runtime = metrics["final_test_runtime_metrics"]
+    assert runtime["timing_scope"] == "host_wall_clock_perf_counter"
+    assert runtime["execution_provider"] == "CPUExecutionProvider"
+    assert runtime["spacecraft_timing_measured"] is False
+    timing_keys = (
+        "input_observation_latency_ms",
+        "preprocessing_latency_ms",
+        "input_quality_latency_ms",
+        "onnx_inference_latency_ms",
+        "policy_latency_ms",
+        "end_to_end_tile_latency_ms",
+    )
+    for key in timing_keys:
+        assert runtime[key]["samples"] > 0
+        assert runtime[key]["avg"] is not None and runtime[key]["avg"] >= 0.0
+    assert runtime["end_to_end_tile_latency_ms"]["avg"] >= runtime["onnx_inference_latency_ms"]["avg"]
 
     assert validation["schema_version"] == 3
     assert validation["split_role"] == "validation"
@@ -109,6 +128,21 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert model_input_schema_sha256(active_bundle / "model.onnx") == active_schema_hash
     assert active_schema["preprocessing"]["channel_policy"] == "exact-no-implicit-conversion"
     assert active_schema["preprocessing"]["tiff_policy"] == "reject-use-npy-or-mission-specific-loader"
+
+    assert run_environment["schema_version"] == 1
+    assert run_environment["seed"] == 5
+    assert run_environment["onnxruntime"]["selected_execution_provider"] == "CPUExecutionProvider"
+    assert len(run_environment["dependency_fingerprint_sha256"]) == 64
+    assert len(run_environment["environment_fingerprint_sha256"]) == 64
+    assert len(run_environment["reference_environment"]["sha256"]) == 64
+    assert run_environment["tracked_package_versions"]["numpy"] is not None
+    assert run_environment["tracked_package_versions"]["torch"] is not None
+
+    assert robustness_environment["schema_version"] == 1
+    assert robustness_environment["seed"] == 17
+    assert robustness["run_environment"]["environment_fingerprint_sha256"] == robustness_environment[
+        "environment_fingerprint_sha256"
+    ]
 
     assert robustness["simulation_only"] is True
     assert robustness["physical_sensor_fidelity_claimed"] is False

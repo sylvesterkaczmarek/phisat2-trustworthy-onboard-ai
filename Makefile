@@ -1,15 +1,31 @@
-.PHONY: install test demo clean
+PYTHON ?= python
+EXAMPLE := examples/phi2-eo-tile-filter
+
+.PHONY: install install-reference lint test check demo robustness clean
 
 install:
-	python -m pip install -e "examples/phi2-eo-tile-filter[dev]"
+	$(PYTHON) -m pip install -e "$(EXAMPLE)[dev]"
+
+install-reference:
+	$(PYTHON) -m pip install -r $(EXAMPLE)/requirements-reference.txt
+	$(PYTHON) -m pip install --no-deps -e $(EXAMPLE)
+
+lint:
+	$(PYTHON) -m ruff check --config $(EXAMPLE)/pyproject.toml assurance $(EXAMPLE)
 
 test:
-	cd examples/phi2-eo-tile-filter && python -m pytest -q
+	cd $(EXAMPLE) && $(PYTHON) -m pytest -q
+
+check: lint test
 
 demo:
-	cd examples/phi2-eo-tile-filter && python scripts/run_demo.py --n 160 --size 32 --bands 3 --epochs 2
+	cd $(EXAMPLE) && $(PYTHON) scripts/run_demo.py --n 160 --size 32 --bands 3 --epochs 2
+
+robustness:
+	cd $(EXAMPLE) && $(PYTHON) scripts/run_robustness_benchmark.py
 
 clean:
-	rm -rf examples/phi2-eo-tile-filter/tiles examples/phi2-eo-tile-filter/logs examples/phi2-eo-tile-filter/reports examples/phi2-eo-tile-filter/runs examples/phi2-eo-tile-filter/downlink
-	rm -rf examples/phi2-eo-tile-filter/models/candidate_bundle examples/phi2-eo-tile-filter/models/bundles
-	rm -f examples/phi2-eo-tile-filter/models/*.onnx examples/phi2-eo-tile-filter/models/*.json examples/phi2-eo-tile-filter/calibration.json
+	rm -rf $(EXAMPLE)/tiles $(EXAMPLE)/logs $(EXAMPLE)/reports $(EXAMPLE)/runs $(EXAMPLE)/downlink
+	rm -rf $(EXAMPLE)/robustness_benchmark $(EXAMPLE)/robustness_downlink
+	rm -rf $(EXAMPLE)/models/candidate_bundle $(EXAMPLE)/models/bundles
+	rm -f $(EXAMPLE)/models/*.onnx $(EXAMPLE)/models/*.json $(EXAMPLE)/calibration.json

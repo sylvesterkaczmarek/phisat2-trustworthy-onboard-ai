@@ -32,9 +32,12 @@ def main() -> None:
 
     from assurance.model_store import resolve_bundle
     from phi2_tile_filter.bandwidth_filter import filter_tiles
+    from phi2_tile_filter.filesystem import assert_safe_workspace_root
+    from phi2_tile_filter.provenance import collect_run_environment, write_run_environment
     from phi2_tile_filter.robustness_benchmark import generate_benchmark, summarize_benchmark
+    from phi2_tile_filter.runtime import OnnxRunner
 
-    root = args.output_root.resolve()
+    root = assert_safe_workspace_root(args.output_root.resolve(), operation="robustness benchmark output")
     models = root / "models"
     logs = root / "logs"
     reports = root / "reports"
@@ -42,6 +45,7 @@ def main() -> None:
     benchmark_downlink = root / "robustness_downlink"
     benchmark_log = logs / "robustness_downlink.jsonl"
     report_path = reports / "robustness_benchmark.json"
+    environment_path = reports / "robustness_environment.json"
 
     active = resolve_bundle(
         models / "bundles",
@@ -79,6 +83,24 @@ def main() -> None:
         benchmark_log,
         event_prevalences=prevalences,
     )
+
+    provider = OnnxRunner(active["model"]).selected_execution_provider
+    environment = collect_run_environment(
+        repo_root,
+        seed=args.seed,
+        selected_execution_provider=provider,
+        run_parameters=vars(args),
+    )
+    write_run_environment(environment_path, environment)
+    report["run_environment"] = {
+        "path": str(environment_path),
+        "git_commit_sha": environment["git"]["commit_sha"],
+        "git_dirty": environment["git"]["dirty"],
+        "dependency_fingerprint_sha256": environment["dependency_fingerprint_sha256"],
+        "environment_fingerprint_sha256": environment["environment_fingerprint_sha256"],
+        "reference_requirements_sha256": environment["reference_environment"]["sha256"],
+    }
+
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -87,6 +109,7 @@ def main() -> None:
         "benchmark_samples": len(manifest["samples"]),
         "downlink_summary": downlink_summary,
         "report": str(report_path),
+        "environment": str(environment_path),
         "category_metrics": report["categories"],
         "prevalence_simulation": report["prevalence_simulation"],
     }

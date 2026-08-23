@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import psutil
 
+from .provenance import collect_run_environment
 from .runtime import OnnxRunner
 
 
@@ -19,6 +20,7 @@ def benchmark(
     intra_op_threads: int | None = None,
     seed: int = 0,
 ) -> dict:
+    """Benchmark ONNX Runtime session.run only on a synthetic in-memory tensor."""
     if iterations <= 0 or warmup < 0:
         raise ValueError("iterations must be positive and warmup non-negative")
     runner = OnnxRunner(model_path, intra_op_threads=intra_op_threads)
@@ -39,26 +41,51 @@ def benchmark(
         latencies.append(latency_ms)
         peak_rss = max(peak_rss, process.memory_info().rss)
     elapsed = time.perf_counter() - started
-    result = {
-        "schema_version": 1,
+    data = np.asarray(latencies, dtype=float)
+    repo_root = Path(__file__).resolve().parents[4]
+    environment = collect_run_environment(
+        repo_root,
+        seed=seed,
+        selected_execution_provider=runner.selected_execution_provider,
+        run_parameters={
+            "iterations": iterations,
+            "warmup": warmup,
+            "intra_op_threads": intra_op_threads,
+            "model_path": str(model_path),
+        },
+    )
+    return {
+        "schema_version": 2,
+        "benchmark_scope": "onnxruntime_session_run_only",
+        "timing_source": "time.perf_counter",
+        "host_measurement_only": True,
+        "spacecraft_timing_measured": False,
+        "execution_provider": runner.selected_execution_provider,
         "model_sha256": runner.model_sha256,
         "iterations": iterations,
         "warmup": warmup,
-        "avg_ms": float(np.mean(latencies)),
-        "p50_ms": float(np.percentile(latencies, 50)),
-        "p90_ms": float(np.percentile(latencies, 90)),
-        "p99_ms": float(np.percentile(latencies, 99)),
-        "throughput_fps": float(iterations / elapsed),
-        "baseline_rss_mb": baseline_rss / 1e6,
-        "peak_rss_mb": peak_rss / 1e6,
-        "peak_delta_mb": (peak_rss - baseline_rss) / 1e6,
+        "onnx_inference_latency_ms": {
+            "avg": float(np.mean(data)),
+            "p50": float(np.percentile(data, 50)),
+            "p90": float(np.percentile(data, 90)),
+            "p99": float(np.percentile(data, 99)),
+        },
+        "wall_clock_throughput_tiles_per_s": float(iterations / elapsed),
+        "process_memory_mb": {
+            "baseline_rss": baseline_rss / 1e6,
+            "peak_rss": peak_rss / 1e6,
+            "peak_delta": (peak_rss - baseline_rss) / 1e6,
+        },
         "intra_op_threads": intra_op_threads,
+        "seed": seed,
+        "environment": environment,
     }
-    return result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Benchmark ONNX Runtime session.run on the host CPU; this is not spacecraft timing."
+    )
     parser.add_argument("--onnx", required=True)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=20)

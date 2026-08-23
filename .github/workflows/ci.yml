@@ -4,27 +4,58 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.11"
+            install-mode: "ranges"
+            run-smoke: false
+          - python-version: "3.12"
+            install-mode: "reference"
+            run-smoke: true
     env:
       PYTHONHASHSEED: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: examples/phi2-eo-tile-filter/requirements.txt
+          cache-dependency-path: |
+            examples/phi2-eo-tile-filter/pyproject.toml
+            examples/phi2-eo-tile-filter/requirements-reference.txt
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e "examples/phi2-eo-tile-filter[dev]"
+          if [ "${{ matrix.install-mode }}" = "reference" ]; then
+            python -m pip install -r examples/phi2-eo-tile-filter/requirements-reference.txt
+            python -m pip install --no-deps -e examples/phi2-eo-tile-filter
+          else
+            python -m pip install -e "examples/phi2-eo-tile-filter[dev]"
+          fi
+      - name: Lint critical errors
+        if: matrix.python-version == '3.12'
+        run: >-
+          python -m ruff check
+          --config examples/phi2-eo-tile-filter/pyproject.toml
+          assurance examples/phi2-eo-tile-filter
       - name: Compile
         run: python -m compileall -q assurance examples/phi2-eo-tile-filter
       - name: Test
         working-directory: examples/phi2-eo-tile-filter
         run: python -m pytest -q
       - name: Smoke demo
+        if: matrix.run-smoke
         working-directory: examples/phi2-eo-tile-filter
-        run: python scripts/run_demo.py --n 96 --size 32 --bands 7 --epochs 1 --seed 0 --output-root /tmp/phi2-demo
+        run: >-
+          python scripts/run_demo.py
+          --n 96 --size 32 --bands 7 --epochs 1 --seed 0
+          --output-root /tmp/phi2-demo

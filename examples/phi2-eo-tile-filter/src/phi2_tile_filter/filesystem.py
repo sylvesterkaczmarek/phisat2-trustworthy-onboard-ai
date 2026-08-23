@@ -37,12 +37,7 @@ def assert_safe_tree_target(
     protected_paths: Iterable[str | Path] = (),
     operation: str = "tree replacement",
 ) -> Path:
-    """Validate a directory target before any recursive removal/replacement.
-
-    The exact filesystem root, home directory, current working directory, and
-    system temporary-directory root are never valid recursive replacement
-    targets. A target must also be disjoint from every protected input path.
-    """
+    """Validate a directory target before any recursive removal/replacement."""
     resolved = _resolved(target)
     filesystem_root = Path(resolved.anchor).resolve(strict=False)
     home = Path.home().resolve(strict=False)
@@ -53,7 +48,6 @@ def assert_safe_tree_target(
     if resolved in unsafe_exact:
         raise ValueError(f"unsafe {operation} target: {resolved}")
 
-    # Deleting an ancestor of the working directory or home is also unsafe.
     if _is_same_or_ancestor(resolved, cwd) or _is_same_or_ancestor(resolved, home):
         raise ValueError(f"unsafe {operation} target contains a protected working path: {resolved}")
 
@@ -67,6 +61,26 @@ def assert_safe_tree_target(
             raise ValueError(
                 f"unsafe {operation}: output {resolved} overlaps protected input {protected_resolved}"
             )
+    return resolved
+
+
+def assert_safe_workspace_root(
+    root: str | Path,
+    *,
+    operation: str = "workspace output",
+) -> Path:
+    """Reject workspace roots whose fixed child outputs could hit shared system locations.
+
+    Unlike ``assert_safe_tree_target``, the current working directory is allowed
+    because the demo intentionally defaults to writing ignored child directories
+    beneath the example directory.
+    """
+    resolved = _resolved(root)
+    filesystem_root = Path(resolved.anchor).resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    temp_root = Path(tempfile.gettempdir()).resolve(strict=False)
+    if resolved in {filesystem_root, home, temp_root}:
+        raise ValueError(f"unsafe {operation} root: {resolved}")
     return resolved
 
 

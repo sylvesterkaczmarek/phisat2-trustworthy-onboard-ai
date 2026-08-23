@@ -8,11 +8,20 @@ from typing import Any
 
 from .utils import sha256_file
 
-TELEMETRY_RECORD_SCHEMA_VERSION = 5
+TELEMETRY_RECORD_SCHEMA_VERSION = 6
+LEGACY_TELEMETRY_RECORD_SCHEMA_VERSIONS = (4, 5)
 FINAL_TEST_RECORD_KIND = "final_test_inference"
 DOWNLINK_RECORD_KIND = "downlink_decision"
 
 _HEX = set(string.hexdigits.lower())
+_TIMING_KEYS = (
+    "input_observation_latency_ms",
+    "preprocessing_latency_ms",
+    "input_quality_latency_ms",
+    "onnx_inference_latency_ms",
+    "policy_latency_ms",
+    "end_to_end_latency_ms",
+)
 
 
 def _is_sha256(value: Any) -> bool:
@@ -118,6 +127,41 @@ def _validate_quality_evidence(record: dict[str, Any]) -> None:
             raise ValueError("disabled input quality guard has invalid input_quality_ok state")
 
 
+def _validate_timing_evidence(record: dict[str, Any]) -> None:
+    provider = record.get("execution_provider")
+    if not isinstance(provider, str) or not provider:
+        raise ValueError("telemetry record is missing execution provider")
+    if record.get("timing_scope") != "host_wall_clock_perf_counter":
+        raise ValueError("telemetry record has unsupported timing scope")
+
+    for key in _TIMING_KEYS:
+        value = record.get(key)
+        if value is not None and (
+            not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0
+        ):
+            raise ValueError(f"telemetry record has invalid {key}")
+
+    end_to_end = record.get("end_to_end_latency_ms")
+    if not isinstance(end_to_end, (int, float)) or not math.isfinite(float(end_to_end)):
+        raise ValueError("telemetry record requires end_to_end_latency_ms")
+
+    if record.get("inference_ok") is True:
+        for key in (
+            "input_observation_latency_ms",
+            "preprocessing_latency_ms",
+            "onnx_inference_latency_ms",
+            "policy_latency_ms",
+        ):
+            if record.get(key) is None:
+                raise ValueError(f"successful inference requires {key}")
+        inference_ms = float(record["onnx_inference_latency_ms"])
+        if float(end_to_end) < inference_ms:
+            raise ValueError("end-to-end latency cannot be smaller than ONNX inference latency")
+        legacy = record.get("latency_ms")
+        if legacy is not None and not math.isclose(float(legacy), inference_ms, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("legacy latency_ms must equal onnx_inference_latency_ms")
+
+
 def validate_telemetry_record(
     record: dict[str, Any],
     *,
@@ -127,7 +171,8 @@ def validate_telemetry_record(
     if not isinstance(record, dict):
         raise ValueError("telemetry record must be an object")
     schema_version = record.get("schema_version")
-    if schema_version not in (4, TELEMETRY_RECORD_SCHEMA_VERSION):
+    supported_versions = (*LEGACY_TELEMETRY_RECORD_SCHEMA_VERSIONS, TELEMETRY_RECORD_SCHEMA_VERSION)
+    if schema_version not in supported_versions:
         raise ValueError("unsupported telemetry record schema version")
     kind = record.get("record_kind")
     if kind not in {FINAL_TEST_RECORD_KIND, DOWNLINK_RECORD_KIND}:
@@ -156,8 +201,10 @@ def validate_telemetry_record(
         raise ValueError("telemetry record is missing retention request")
     if not isinstance(record.get("decision"), str) or not record["decision"]:
         raise ValueError("telemetry record is missing decision")
-    if schema_version == TELEMETRY_RECORD_SCHEMA_VERSION:
+    if schema_version >= 5:
         _validate_quality_evidence(record)
+    if schema_version >= 6:
+        _validate_timing_evidence(record)
 
     input_hash = record.get("input_sha256")
     size_bytes = record.get("size_bytes")

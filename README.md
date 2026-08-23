@@ -3,18 +3,20 @@
 ![PhiSat-2 Trustworthy Onboard AI](assets/social/github-social-card-phisat2-onboard-ai.png)
 
 [![CI](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sylvesterkaczmarek/phisat2-trustworthy-onboard-ai/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17567181.svg)](https://doi.org/10.5281/zenodo.17567181)
 
-Research demonstrator for deterministic Earth-observation tile triage, PyTorch to ONNX deployment, static INT8 quantization, conservative downlink fallback, input-quality/OOD screening, deployment-bound telemetry, and coherent model-policy-preprocessing rollback. The workflow is inspired by onboard EO processing such as PhiSat-2, but it is independent software and is not ESA or PhiSat-2 flight code.
+A research reference implementation for trustworthy onboard Earth-observation tile triage: deterministic data generation, PyTorch training, ONNX export, static INT8 quantization, statistically explicit calibration, validation-only acceptance gates, conservative data-retention fallback, deployment-bound telemetry, coherent rollback, and deterministic robustness stress testing.
 
-## At a glance
+The workflow is inspired by onboard EO processing such as PhiSat-2, but it is independent software and is **not ESA or PhiSat-2 flight code**.
+
+## What the repository demonstrates
 
 ```mermaid
 flowchart LR
-    A[Train split + input schema] --> B[TinyCNN checkpoint]
+    A[Train split + input schema] --> B[PyTorch model]
     B --> C[FP32 ONNX]
     C --> D[INT8 QDQ]
     E[Calibration split] --> F[Threshold + temperature + recall evidence + quality guard]
@@ -23,45 +25,34 @@ flowchart LR
     C --> G
     D --> G
     F --> G
-    D --> K[Deployment bundle]
+    D --> K[Immutable deployment bundle]
     F --> K
     G --> K
     K --> L[Atomic active bundle pointer]
     T[Final test split] --> H[Runtime telemetry + conservative policy]
     L --> H
     H --> I[Staged downlink materialisation]
-    I --> J[Identity reconciliation + final report]
+    I --> J[Integrity reconciliation + final report]
     L --> R[Optional robustness benchmark]
     R --> S[Nominal / degraded / corrupted / OOD report]
 ```
 
-The design uses four independent lifecycle data roles and a versioned input/preprocessing contract. A deployable configuration is an immutable bundle that binds the ONNX model to its band ordering, preprocessing schema, calibrated policy, input-quality guard, and validation evidence.
+Implemented assurance mechanisms include:
 
-## What is implemented
-
-- deterministic synthetic EO data with independent `train`, `calib`, `validation`, and final `test` splits
-- versioned EO input schema with ordered bands, optional wavelengths, layout, dtype/range, normalization, nodata policy, and preprocessing version
-- canonical input-contract SHA-256 propagated through dataset, checkpoint, ONNX, calibration, validation, telemetry, and deployment bundle
-- PyTorch to FP32 ONNX export with numerical verification
-- static QDQ INT8 quantization with validation-only regression gates
-- calibrated event threshold, deterministic temperature scaling, and one-sided exact Clopper-Pearson recall evidence
-- lightweight calibrated input-quality/OOD guard using standardized per-band and image-statistics features
-- conservative fallback for low confidence, quality-guard triggers, input/preprocessing failures, and inference failures
-- deployment-bound telemetry carrying bundle, model, policy, schema, preprocessing, and per-input hashes
-- staged filesystem writes and per-file retained-copy hash verification
-- immutable content-addressed deployment bundles with coherent rollback
-- process watchdog with timeout, optional heartbeat, terminate/kill escalation, and structured telemetry
-- optional deterministic EO robustness benchmark with nominal, degraded, corrupted, and OOD categories
-- category-specific robustness metrics and configurable prevalence-weighted source-byte estimates
-- CI that exercises the full seven-band demo and a lightweight robustness smoke benchmark
-
-## Decision policy
-
-A tile is requested for retention when it is predicted to contain the target event, when confidence is low, when the calibrated input-quality guard marks it outside the nominal operating region, or when input observation/preprocessing/inference fails. Only a confidently classified background tile that passes the quality guard is intentionally discarded.
-
-The input-quality guard is intentionally lightweight. It standardizes per-band means/stds plus saturation and spatial-variation features using the calibration split and computes a diagonal standardized-distance score. A trigger produces `input_quality_fallback`, retaining the tile rather than trusting a potentially confident model prediction.
-
-This is a practical demonstrator mechanism, not a guaranteed OOD detector.
+- four independent data roles: `train`, `calib`, `validation`, and final `test`;
+- a versioned EO input/preprocessing contract with ordered bands, layout, dtype/range, normalization, nodata policy, optional wavelength metadata, and preprocessing version;
+- SHA-256 binding of the input contract through dataset, checkpoint, ONNX, calibration, validation, telemetry, and deployment bundle;
+- FP32 ONNX export with numerical verification and static QDQ INT8 quantization;
+- validation-only quantization gates for classification, event retention, decision agreement, and score drift;
+- empirical event recall plus a one-sided exact Clopper-Pearson lower confidence bound;
+- a calibrated lightweight input-quality/OOD guard;
+- conservative retention on event detection, low confidence, input-quality trigger, input/preprocessing failure, or inference failure;
+- deployment-bound telemetry carrying bundle, model, policy, schema, preprocessing, and per-input hashes;
+- staged filesystem writes and post-copy hash verification;
+- immutable content-addressed deployment bundles with coherent model-policy-schema rollback;
+- process watchdog timeout, optional heartbeat monitoring, terminate/kill escalation, and structured restart telemetry;
+- deterministic nominal/degraded/corrupted/OOD robustness stress testing;
+- automatic run provenance and explicit host timing breakdown.
 
 ## Quick start
 
@@ -82,7 +73,7 @@ python scripts/run_demo.py \
   --output-root /tmp/phi2-7band
 ```
 
-Then evaluate the deployed bundle under deterministic stress:
+Then run the separate post-deployment robustness benchmark:
 
 ```bash
 python scripts/run_robustness_benchmark.py \
@@ -92,136 +83,179 @@ python scripts/run_robustness_benchmark.py \
   --event-prevalences 0.01,0.05,0.10
 ```
 
+## Reproducible reference environment
+
+`pyproject.toml` is the canonical source of supported dependency ranges. For a concrete pinned reference environment:
+
+```bash
+cd examples/phi2-eo-tile-filter
+python -m pip install -r requirements-reference.txt
+python -m pip install --no-deps -e .
+```
+
+Every complete demo automatically writes `reports/run_environment.json`; the robustness run writes `reports/robustness_environment.json`. These artifacts record Git commit/dirty state, Python and platform details, CPU/GPU information where available, package versions, ONNX Runtime provider, run seed/parameters, the reference-requirements SHA-256, and installed-environment fingerprints.
+
+See [docs/reproducibility.md](docs/reproducibility.md) for details.
+
+## Decision policy
+
+A tile is requested for retention when any of the following applies:
+
+1. event probability meets the calibrated event threshold;
+2. model confidence is below the configured minimum;
+3. the calibrated input-quality guard places the input outside the nominal calibration region;
+4. input observation, preprocessing, or inference fails.
+
+Only a confidently classified background tile that passes the input-quality guard is intentionally discarded.
+
+The quality guard uses standardized per-band means/stds plus saturation and spatial-variation features. It is lightweight and deterministic. It is **not** a universal or statistically guaranteed OOD detector.
+
+## Scientific evaluation lifecycle
+
+The final test set is not used to accept a model.
+
+- `train`: parameter fitting only.
+- `calib`: INT8 calibration, event-threshold/temperature selection, recall-bound evidence, and input-quality-guard calibration.
+- `validation`: FP32 versus INT8 and calibrated-policy acceptance gates.
+- `test`: final reporting after the bundle has already passed acceptance and promotion.
+
+The requested recall is a threshold-selection target. The calibration artifact separately reports achieved empirical recall and its one-sided exact Clopper-Pearson lower confidence bound.
+
 ## Robustness benchmark
 
-The normal synthetic square-event generator remains the fast default used for training and CI. The separate robustness benchmark does not modify training, calibration, validation, or deployment state.
+The ordinary square-event generator remains the fast deterministic default. The optional benchmark adds four post-deployment categories:
 
-It evaluates four categories:
+- **nominal**: the original synthetic distribution;
+- **degraded**: noise, illumination shift, per-band gain/offset drift, blur, cloud-like occlusion, spatial shift, and spectral shift;
+- **corrupted**: missing/corrupt bands, saturation, and dead-pixel/stripe patterns;
+- **OOD**: deterministic checkerboard, sinusoidal, radial, and striped unknown backgrounds with changed spectral structure.
 
-- **nominal**: the existing deterministic square-event distribution
-- **degraded**: noise, illumination shifts, per-band gain/offset drift, blur, cloud-like occlusion, spatial shifts, and spectral distribution shifts
-- **corrupted**: missing-band zero fill, non-finite bands, saturation, and dead-pixel/stripe patterns
-- **OOD**: deterministic unknown checkerboard, sinusoidal, radial, and striped backgrounds with changed spectral structure
+The benchmark reports event retention, background rejection, fallback rate, quality/degradation detection, inference failures, and source-file byte retention separately by category.
 
-Perturbation magnitudes are configurable. The benchmark records every sample's condition and perturbation recipe in `benchmark_manifest.json`.
+These perturbations are simulation tools only. They are **not physically calibrated sensor, atmosphere, optics, cloud, compression, radiation, or spacecraft models**.
 
-These are controlled simulation stressors, **not physically calibrated PhiSat-2 or EO sensor models**. They do not reproduce real detector noise, atmosphere, optics, clouds, compression, or spacecraft conditions.
+## Source-byte and prevalence reporting
 
-The robustness report separates, by category:
+The repository reports source-file byte reduction, not spacecraft link bandwidth. Metrics use names such as:
 
-- event retention recall
-- background rejection rate
-- retained fraction
-- fallback rate
-- input-quality guard trigger rate
-- quality/preprocessing detection rate
-- OOD or degradation detection rate
-- inference-failure rate
-- source bytes retained and reduced
+- `source_bytes_total`;
+- `source_bytes_retained`;
+- `source_bytes_reduction_fraction` / `source_bytes_reduction_pct`;
+- `expected_source_bytes_reduction_fraction`.
 
-## Prevalence simulation
+Reports explicitly set `operational_link_bandwidth_measured: false` because packetisation, framing, FEC, retransmissions, contact geometry, protocol overhead, and adaptive coding/modulation are outside this demonstrator.
 
-The ordinary synthetic benchmark is deliberately balanced for testing. Many operational event-detection tasks are not.
+The robustness report can calculate expected retention under user-supplied event prevalence scenarios without claiming that the balanced synthetic dataset represents operational prevalence.
 
-The robustness report therefore accepts configurable event prevalences such as `0.01,0.05,0.10`. It combines those user-supplied prevalences with nominal synthetic class-conditional retention and mean source-file sizes to report:
+## Timing terminology
 
-- `expected_retained_fraction`
-- `expected_source_bytes_reduction_fraction`
+Runtime telemetry distinguishes:
 
-This is a scenario calculation, not measured mission traffic. The prevalence is not inferred from the balanced demo.
+- input observation/hash latency;
+- preprocessing latency;
+- input-quality-guard latency;
+- ONNX Runtime `session.run` latency;
+- probability/policy evaluation latency;
+- end-to-end per-tile wall-clock latency.
 
-## Byte-accounting terminology
+The standalone `bench_onnxruntime` benchmark measures only ONNX Runtime `session.run` on an in-memory tensor. All timing is labelled as host measurement. Desktop/CI CPU results are **not spacecraft timing, WCET, or hardware qualification evidence**.
 
-The repository reports **source-file byte reduction**, not spacecraft link bandwidth.
+## Using real EO data
 
-Current metrics use names such as:
+The synthetic generator is optional infrastructure, not a required model interface. To substitute real EO data:
 
-- `source_bytes_total`
-- `source_bytes_retained`
-- `source_bytes_reduction_fraction` / `source_bytes_reduction_pct`
-- `expected_source_bytes_reduction_fraction`
+1. create independent train/calibration/validation/final-test partitions;
+2. represent supported data as arrays under an explicit `input_schema.json`;
+3. replace generic band IDs with validated sensor-specific band identity/order and, where available, wavelength metadata;
+4. define real radiometric range/scaling, normalization, nodata, and preprocessing semantics in the schema;
+5. run the individual training, ONNX export, quantization, calibration, validation, bundle, and telemetry stages against those partitions;
+6. keep the final test outside model/policy acceptance decisions.
 
-Reports explicitly state `operational_link_bandwidth_measured: false` because the demonstrator does not model packetisation, framing, FEC, retransmissions, contact geometry, protocol overhead, adaptive coding/modulation, or other link-layer behaviour.
+The generic loader deliberately rejects TIFF/GeoTIFF rather than silently reducing scientific imagery through generic 8-bit PIL conversion. Real scientific TIFF/GeoTIFF should use a sensor-aware ingest implementation that preserves band identity, bit depth, scale/offset, nodata, and geospatial metadata.
+
+## Deployment and telemetry integrity
+
+A deployable bundle contains the exact:
+
+- `model.onnx`;
+- `policy.json`;
+- `input_schema.json`;
+- `validation.json`;
+- `bundle.json` manifest.
+
+Promotion verifies the bundle before atomically changing the active bundle pointer. Rollback changes the complete bundle, so an old model cannot intentionally be paired with a newer policy or preprocessing contract.
+
+Runtime telemetry identifies the deployment bundle, model, policy, semantic input contract, exact schema file, preprocessing fingerprint, and observed input file. The final summarizer refuses to combine inconsistent final-test/downlink records.
+
+See [docs/assurance.md](docs/assurance.md) for the full assurance model.
 
 ## Generated outputs
 
-A main run produces:
+A main run produces, among other artifacts:
 
 ```text
 tiles/input_schema.json
 calibration.json
 logs/test.jsonl
 logs/downlink.jsonl
-models/tinycnn_fp32.onnx.input_schema.json
-models/tinycnn_int8.onnx.input_schema.json
-models/candidate_bundle/
 models/bundles/<bundle_id>/
 models/deployment_state.json
 reports/model_validation.json
 reports/metrics.json
 reports/summary.md
+reports/run_environment.json
 ```
 
 The optional robustness run additionally produces:
 
 ```text
-robustness_benchmark/input_schema.json
 robustness_benchmark/benchmark_manifest.json
 robustness_benchmark/<category>/...
 robustness_downlink/
 logs/robustness_downlink.jsonl
 reports/robustness_benchmark.json
+reports/robustness_environment.json
 ```
 
-## Validation and deployment integrity
+## CI and local checks
 
-The pipeline fails rather than silently continuing when dataset/schema metadata disagree, model/schema bindings differ, calibration belongs to another model/contract, quantization regressions exceed validation criteria, a deployment component hash is inconsistent, or runtime telemetry cannot be reconciled.
+CI tests supported Python 3.11 and 3.12. Python 3.11 exercises the supported dependency ranges; Python 3.12 exercises the pinned reference environment and standalone smoke demo. Both run the complete pytest suite. Ruff is used only for high-confidence syntax/name checks, not a repository-wide style rewrite.
 
-Policy schema version 5 includes the calibrated input-quality guard. The complete policy file is hashed inside the deployment bundle, so model, calibration thresholds, quality-guard parameters, input contract, and validation evidence move together during promotion and rollback.
-
-Telemetry records include the deployment bundle ID, model SHA-256, calibration-policy SHA-256, semantic input-contract hash, exact schema-file SHA-256, preprocessing fingerprint, and per-input SHA-256. Retained copies are re-hashed after materialisation.
-
-## Input contract and file formats
-
-`input_schema.json` captures ordered band identity and preprocessing semantics, not merely tensor dimensions. Explicit schemas remove CHW/HWC guessing for strict model execution.
-
-PNG/JPEG utility loading never manufactures or discards channels. TIFF/GeoTIFF are deliberately rejected by the generic loader because scientific TIFF frequently carries high-bit-depth, multiband, scale/offset, nodata, and geospatial semantics requiring an EO-specific ingest path.
-
-The generated seven-band example uses generic `band_01` through `band_07` identifiers. It does not claim PhiSat-2 spectral equivalence.
-
-## Watchdog
-
-The process-level watchdog can restart non-zero exits and detect wall-clock or optional heartbeat timeouts:
+From the repository root:
 
 ```bash
-python ../../assurance/watchdog.py \
-  --restarts 3 \
-  --timeout-s 30 \
-  --terminate-grace-s 2 \
-  --log logs/watchdog.jsonl \
-  -- python your_inference_command.py
+make install
+make check
+make demo
 ```
 
-On timeout it requests termination first and escalates to kill if required. This is a research assurance pattern, not flight FDIR.
-
-## Reproducibility
-
-See [docs/reproducibility.md](docs/reproducibility.md). Training and benchmark generation use explicit seeds. Robustness manifests record perturbation settings. CI keeps the robustness sample count small so the standard workflow remains lightweight.
+For the pinned environment, use `make install-reference`.
 
 ## What this repository does not claim
 
-This is a software and assurance demonstrator. It does not establish PhiSat-2 performance, operational EO accuracy, physical sensor fidelity, flight readiness, radiation tolerance, worst-case execution time, hardware qualification, formal safety, validated OOD guarantees, authenticated telemetry, or mission-level fault tolerance.
+This repository improves experimental hygiene, software integrity, conservative failure behaviour, and reproducible reporting for an onboard-AI demonstrator. It does **not** establish:
 
-Synthetic stress results show behaviour under declared artificial perturbations only. Input-contract hashes prove consistency of declared metadata, not that upstream sensor labels are correct. A real deployment would require representative sensor data, validated degradation/shift models, trusted provenance, sensor-specific radiometric ingestion, hardware-in-the-loop testing, resource/thermal limits, fault injection, signed update/telemetry handling, and mission-specific acceptance criteria.
+- PhiSat-2 performance or sensor equivalence;
+- operational EO accuracy;
+- physical sensor-fidelity of synthetic perturbations;
+- a guaranteed OOD detector;
+- flight readiness or hardware qualification;
+- radiation tolerance;
+- worst-case execution time;
+- formal safety;
+- authenticated/adversarially tamper-proof telemetry;
+- mission-level fault tolerance.
+
+A real flight programme would still require representative mission data, trusted provenance, sensor-specific radiometric ingestion, target-hardware/HIL testing, resource and thermal limits, fault injection, signed update and telemetry handling, platform-specific persistent-storage guarantees, and mission-specific assurance criteria.
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.11 or 3.12
 - PyTorch 2.x
 - ONNX and ONNX Runtime for export, quantization, and inference
 - no accelerator required for the CI-scale CPU demonstration
 
-Dependency bounds are defined in [`examples/phi2-eo-tile-filter/pyproject.toml`](examples/phi2-eo-tile-filter/pyproject.toml).
+Supported dependency ranges are defined in [`examples/phi2-eo-tile-filter/pyproject.toml`](examples/phi2-eo-tile-filter/pyproject.toml). The pinned reference set is [`examples/phi2-eo-tile-filter/requirements-reference.txt`](examples/phi2-eo-tile-filter/requirements-reference.txt).
 
 ## Cite this repository
 

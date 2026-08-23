@@ -75,6 +75,8 @@ class OnnxRunner:
             sess_options=options,
             providers=["CPUExecutionProvider"],
         )
+        self.execution_providers = tuple(self.session.get_providers())
+        self.selected_execution_provider = self.execution_providers[0]
         self.spec = input_spec_from_session(self.session)
         self.model_sha256 = sha256_file(self.model_path)
         self.input_schema_file_sha256 = sha256_file(self.input_schema_path)
@@ -91,6 +93,7 @@ class OnnxRunner:
         assert_dataset_schema_compatible(data_root, self.input_schema)
 
     def logits_for_array(self, array_chw: np.ndarray) -> tuple[np.ndarray, float]:
+        """Return logits plus ONNX Runtime session.run wall-clock latency in milliseconds."""
         x = np.asarray(array_chw)
         if x.dtype != np.float32:
             raise ValueError(f"expected float32 model input, got {x.dtype}")
@@ -119,9 +122,10 @@ class OnnxRunner:
         deployment_bundle_verified: bool = False,
         record_kind: str = DOWNLINK_RECORD_KIND,
     ) -> dict:
-        """Evaluate one input without allowing file/I/O failures to escape."""
+        """Evaluate one input with conservative failure handling and timing breakdown."""
         path = Path(path)
         guard = policy.input_quality_guard
+        end_to_end_started = perf_counter()
         record: dict[str, Any] = {
             "schema_version": TELEMETRY_RECORD_SCHEMA_VERSION,
             "record_kind": record_kind,
@@ -135,6 +139,8 @@ class OnnxRunner:
             "preprocessing_sha256": self.preprocessing_sha256,
             "input_band_ids": list(self.band_ids),
             "preprocessing_version": self.input_schema["preprocessing"]["version"],
+            "execution_provider": self.selected_execution_provider,
+            "timing_scope": "host_wall_clock_perf_counter",
             "input_sha256": None,
             "size_bytes": None,
             "input_mtime_ns": None,
@@ -157,11 +163,19 @@ class OnnxRunner:
             "retention_requested": True,
             "kept": True,
             "decision": "inference_failure_fallback",
+            "input_observation_latency_ms": None,
+            "preprocessing_latency_ms": None,
+            "input_quality_latency_ms": None,
+            "onnx_inference_latency_ms": None,
+            "policy_latency_ms": None,
+            "end_to_end_latency_ms": None,
+            # Backward-compatible alias. It always means ONNX session.run only.
             "latency_ms": None,
         }
 
         failure_stage = "stat_input"
         try:
+            observation_started = perf_counter()
             before = path.stat()
             before_fingerprint = _stat_fingerprint(before)
             record["size_bytes"] = int(before.st_size)
@@ -173,9 +187,16 @@ class OnnxRunner:
             if _stat_fingerprint(after_hash) != before_fingerprint:
                 raise RuntimeError("input file changed while it was being hashed")
             record["input_observation_ok"] = True
+            record["input_observation_latency_ms"] = (
+                perf_counter() - observation_started
+            ) * 1000.0
 
             failure_stage = "preprocess_input"
+            preprocessing_started = perf_counter()
             array = load_tile_numpy(path, input_schema=self.input_schema)
+            record["preprocessing_latency_ms"] = (
+                perf_counter() - preprocessing_started
+            ) * 1000.0
             after_preprocess = path.stat()
             if _stat_fingerprint(after_preprocess) != before_fingerprint:
                 record["input_observation_ok"] = False
@@ -184,27 +205,36 @@ class OnnxRunner:
             input_quality_ok: bool | None = True
             if guard is not None:
                 failure_stage = "input_quality_guard"
+                quality_started = perf_counter()
                 assessment = guard.assess(array)
+                record["input_quality_latency_ms"] = (
+                    perf_counter() - quality_started
+                ) * 1000.0
                 input_quality_ok = bool(assessment.in_distribution)
                 record["input_quality_score"] = float(assessment.score)
                 record["input_quality_threshold"] = float(assessment.threshold)
                 record["input_quality_ok"] = input_quality_ok
             else:
+                record["input_quality_latency_ms"] = 0.0
                 record["input_quality_ok"] = True
 
             failure_stage = "onnx_inference"
-            logits, latency_ms = self.logits_for_array(array)
+            logits, inference_latency_ms = self.logits_for_array(array)
+            record["onnx_inference_latency_ms"] = float(inference_latency_ms)
+            record["latency_ms"] = float(inference_latency_ms)
+
+            failure_stage = "decision_policy"
+            policy_started = perf_counter()
             probabilities = softmax(logits, temperature=policy.temperature)[0]
             prob_event = float(probabilities[1])
             max_prob = float(probabilities.max())
-
-            failure_stage = "decision_policy"
             retain, decision = policy.decide(
                 prob_event=prob_event,
                 max_prob=max_prob,
                 inference_ok=True,
                 input_quality_ok=input_quality_ok,
             )
+            record["policy_latency_ms"] = (perf_counter() - policy_started) * 1000.0
             record.update(
                 {
                     "inference_ok": True,
@@ -217,7 +247,6 @@ class OnnxRunner:
                     "retention_requested": bool(retain),
                     "kept": bool(retain),
                     "decision": decision,
-                    "latency_ms": float(latency_ms),
                 }
             )
         except Exception as exc:
@@ -239,7 +268,10 @@ class OnnxRunner:
                     "retention_requested": bool(retain),
                     "kept": bool(retain),
                     "decision": decision,
-                    "latency_ms": None,
                 }
             )
+        finally:
+            record["end_to_end_latency_ms"] = (
+                perf_counter() - end_to_end_started
+            ) * 1000.0
         return record
