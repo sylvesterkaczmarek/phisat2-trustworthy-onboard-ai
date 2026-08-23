@@ -48,14 +48,26 @@ def _policy_metrics(y_true: np.ndarray, kept: np.ndarray) -> dict:
     }
 
 
-def _policy_kept(policy: DecisionPolicy, probabilities: np.ndarray) -> np.ndarray:
+def _quality_ok(policy: DecisionPolicy, arrays: list[np.ndarray]) -> np.ndarray:
+    guard = policy.input_quality_guard
+    if guard is None:
+        return np.ones(len(arrays), dtype=bool)
+    return np.asarray([guard.assess(array).in_distribution for array in arrays], dtype=bool)
+
+
+def _policy_kept(
+    policy: DecisionPolicy,
+    probabilities: np.ndarray,
+    quality_ok: np.ndarray,
+) -> np.ndarray:
     decisions = [
         policy.decide(
             prob_event=float(row[1]),
             max_prob=float(np.max(row)),
             inference_ok=True,
+            input_quality_ok=bool(ok),
         )[0]
-        for row in probabilities
+        for row, ok in zip(probabilities, quality_ok)
     ]
     return np.asarray(decisions, dtype=bool)
 
@@ -108,12 +120,14 @@ def validate_models(
         raise ValueError("validation set is empty")
 
     y_true: list[int] = []
+    arrays: list[np.ndarray] = []
     fp32_logits_list: list[np.ndarray] = []
     int8_logits_list: list[np.ndarray] = []
     for path, cls in items:
         array = load_tile_numpy(path, input_schema=int8.input_schema)
         fp32_logits, _ = fp32.logits_for_array(array)
         int8_logits, _ = int8.logits_for_array(array)
+        arrays.append(array)
         y_true.append(cls)
         fp32_logits_list.append(fp32_logits[0])
         int8_logits_list.append(int8_logits[0])
@@ -130,10 +144,11 @@ def validate_models(
     fp32_scores = fp32_probs[:, 1]
     int8_scores = int8_probs[:, 1]
 
+    quality_ok = _quality_ok(policy, arrays)
     fp32_classification = _classification_metrics(y, fp32_pred, fp32_scores)
     int8_classification = _classification_metrics(y, int8_pred, int8_scores)
-    fp32_kept = _policy_kept(policy, fp32_probs)
-    int8_kept = _policy_kept(policy, int8_probs)
+    fp32_kept = _policy_kept(policy, fp32_probs, quality_ok)
+    int8_kept = _policy_kept(policy, int8_probs, quality_ok)
     fp32_policy = _policy_metrics(y, fp32_kept)
     int8_policy = _policy_metrics(y, int8_kept)
 
@@ -219,6 +234,12 @@ def validate_models(
         "preprocessing_version": int8.input_schema["preprocessing"]["version"],
         "policy_model_sha256": int8.model_sha256,
         "policy_temperature": float(policy.temperature),
+        "input_quality_guard_validation": {
+            "enabled": policy.input_quality_guard is not None,
+            "method": None if policy.input_quality_guard is None else policy.input_quality_guard.method,
+            "flagged_samples": int(np.sum(~quality_ok)),
+            "flag_rate": float(np.mean(~quality_ok)),
+        },
         "classification_metrics": {
             "fp32": fp32_classification,
             "int8": int8_classification,
