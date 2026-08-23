@@ -65,9 +65,10 @@ def _records_by_file(records: list[dict], *, label: str) -> dict[str, dict]:
 
 
 def _calibration_metadata(calibration: dict) -> dict:
-    if calibration.get("schema_version") in (3, 4):
+    if calibration.get("schema_version") in (3, 4, 5):
         stats = calibration.get("calibration_statistics", {})
         acceptance = calibration.get("calibration_acceptance", {})
+        guard = calibration.get("input_quality_guard")
         return {
             "event_threshold": calibration.get("event_threshold"),
             "min_confidence": calibration.get("min_confidence"),
@@ -76,6 +77,7 @@ def _calibration_metadata(calibration: dict) -> dict:
             "input_schema_sha256": calibration.get("input_schema_sha256"),
             "input_band_ids": calibration.get("input_band_ids"),
             "preprocessing_version": calibration.get("preprocessing_version"),
+            "input_quality_guard": guard,
             "calibration_samples_total": stats.get("samples_total"),
             "calibration_event_samples": stats.get("event_samples"),
             "calibration_target_event_recall_for_threshold_selection": stats.get(
@@ -104,8 +106,6 @@ def _verify_telemetry_integrity(
     calibration: dict,
     calibration_path: str | Path,
 ) -> tuple[dict[str, dict], dict[str, dict], dict]:
-    # Surface a declared scientific-contract mismatch before record-version errors.
-    # Old telemetry is still rejected below when the contracts agree.
     declared_test_schema = _one_value(test, "input_schema_sha256")
     declared_down_schema = _one_value(downlink, "input_schema_sha256")
     if declared_test_schema != declared_down_schema:
@@ -202,18 +202,20 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
 
     event_records = [record for record in test if int(record["true_class"]) == 1]
     background_records = [record for record in test if int(record["true_class"]) == 0]
-    event_kept = sum(bool(down_by_file[record["file"]]["retained_for_downlink"]) for record in event_records)
+    event_retained = sum(
+        bool(down_by_file[record["file"]]["retained_for_downlink"]) for record in event_records
+    )
     background_discarded = sum(
         not bool(down_by_file[record["file"]]["retained_for_downlink"])
         for record in background_records
     )
-    event_retention_recall = event_kept / len(event_records) if event_records else 0.0
+    event_retention_recall = event_retained / len(event_records) if event_records else 0.0
     background_rejection_rate = (
         background_discarded / len(background_records) if background_records else 0.0
     )
 
-    total_bytes = sum(int(record["size_bytes"]) for record in downlink)
-    kept_bytes = sum(
+    source_bytes_total = sum(int(record["size_bytes"]) for record in downlink)
+    source_bytes_retained = sum(
         int(record["size_bytes"])
         for record in downlink
         if record["retained_for_downlink"]
@@ -227,9 +229,12 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
         bool(record["retention_requested"]) and not bool(record["retained_for_downlink"])
         for record in downlink
     )
+    fallback_count = sum(str(record["decision"]).endswith("fallback") for record in downlink)
+    quality_fallback_count = sum(record["decision"] == "input_quality_fallback" for record in downlink)
+    quality_guard_enabled = bool(_one_value(downlink, "input_quality_guard_enabled"))
 
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "split_role": "final_test",
         "deployment_bundle_id": identity["deployment_bundle_id"],
         "model_sha256": identity["model_sha256"],
@@ -254,20 +259,27 @@ def summarize(test_log: str | Path, downlink_log: str | Path, calibration_path: 
             "pr_auc_average_precision": pr_auc,
         },
         "calibration_policy_metadata": _calibration_metadata(calibration),
+        "final_test_input_quality_metrics": {
+            "guard_enabled": quality_guard_enabled,
+            "input_quality_fallback_tiles": int(quality_fallback_count),
+            "input_quality_fallback_rate": float(quality_fallback_count / len(downlink)),
+        },
         "final_test_downlink_retention_metrics": {
             "event_retention_recall": float(event_retention_recall),
             "background_rejection_rate": float(background_rejection_rate),
-            "tiles_kept": sum(bool(record["retained_for_downlink"]) for record in downlink),
+            "tiles_retained": sum(bool(record["retained_for_downlink"]) for record in downlink),
             "tiles_total": len(downlink),
-            "fallback_tiles": sum(
-                str(record["decision"]).endswith("fallback") for record in downlink
-            ),
+            "fallback_tiles": int(fallback_count),
+            "fallback_rate": float(fallback_count / len(downlink)),
             "downlink_materialization_failures": int(materialization_failures),
-            "bytes_total": total_bytes,
-            "bytes_kept": kept_bytes,
-            "downlink_bytes_saved_pct": (
-                100.0 * (1.0 - kept_bytes / total_bytes) if total_bytes else 0.0
+            "source_bytes_total": source_bytes_total,
+            "source_bytes_retained": source_bytes_retained,
+            "source_bytes_reduction_pct": (
+                100.0 * (1.0 - source_bytes_retained / source_bytes_total)
+                if source_bytes_total
+                else 0.0
             ),
+            "operational_link_bandwidth_measured": False,
         },
         "final_test_runtime_metrics": {
             "avg_inference_latency_ms": float(np.mean(latencies)) if latencies else None,
