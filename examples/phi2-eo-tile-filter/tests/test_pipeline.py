@@ -11,6 +11,7 @@ pytest.importorskip("onnx")
 pytest.importorskip("onnxruntime")
 
 from phi2_tile_filter.input_schema import input_schema_sha256, model_input_schema_sha256, read_input_schema
+from phi2_tile_filter.utils import sha256_file
 
 
 def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
@@ -108,6 +109,7 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert validation["accepted"] is True
     assert all(validation["acceptance_checks"].values())
     assert validation["input_quality_guard_validation"]["enabled"] is True
+    assert validation["policy_sha256"] == sha256_file(active_bundle / "policy.json")
 
     assert active_policy["schema_version"] == 5
     assert active_policy["split_role"] == "calibration"
@@ -124,6 +126,7 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert bundle_manifest["bundle_version"] == 2
     assert bundle_manifest["bundle_id"] == state["active_bundle_id"]
     assert bundle_manifest["model_sha256"] == active_policy["model_sha256"]
+    assert bundle_manifest["policy_sha256"] == validation["policy_sha256"]
     assert bundle_manifest["input_contract_sha256"] == source_schema_hash == active_schema_hash
     assert model_input_schema_sha256(active_bundle / "model.onnx") == active_schema_hash
     assert active_schema["preprocessing"]["channel_policy"] == "exact-no-implicit-conversion"
@@ -147,6 +150,11 @@ def test_complete_multispectral_pipeline(tmp_path: Path) -> None:
     assert robustness["simulation_only"] is True
     assert robustness["physical_sensor_fidelity_claimed"] is False
     assert robustness["input_quality_guard_enabled"] is True
+    assert robustness["telemetry_integrity"]["deployment_bundle_verified"] is True
+    assert robustness["telemetry_integrity"]["benchmark_manifest_schema_verified"] is True
+    assert robustness["telemetry_integrity"]["benchmark_input_hashes_verified"] is True
+    assert robustness["deployment_bundle_id"] == state["active_bundle_id"]
+    assert robustness["policy_sha256"] == bundle_manifest["policy_sha256"]
     assert set(robustness["categories"]) == {"nominal", "degraded", "corrupted", "ood"}
     for category in robustness["categories"].values():
         assert "source_bytes_reduction_fraction" in category
