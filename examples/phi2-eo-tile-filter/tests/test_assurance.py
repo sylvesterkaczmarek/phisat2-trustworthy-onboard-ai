@@ -221,7 +221,7 @@ def test_bundle_rejects_mismatched_preprocessing_metadata(tmp_path: Path) -> Non
     schema = json.loads(schema_path.read_text())
     schema["normalization"]["version"] = 2
     schema_path.write_text(json.dumps(schema))
-    with pytest.raises(ValueError, match="preprocessing contract"):
+    with pytest.raises(ValueError, match="preprocessing_sha256"):
         build_bundle(model, policy, validation, tmp_path / "bundle")
 
 
