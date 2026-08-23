@@ -24,8 +24,10 @@ from phi2_tile_filter.input_schema import (
     build_input_schema,
     input_schema_sha256,
     model_schema_sidecar_path,
+    read_input_schema,
     write_input_schema,
 )
+from phi2_tile_filter.telemetry import resolve_artifact_identity
 
 
 def _write_test_model(
@@ -64,7 +66,7 @@ def _write_test_model(
     onnx.save(model, path)
 
 
-def _valid_validation_payload(model_hash: str, schema_hash: str) -> dict:
+def _valid_validation_payload(model_hash: str, schema_hash: str, policy_hash: str) -> dict:
     checks = {
         "classification_accuracy_drop": True,
         "classification_argmax_agreement": True,
@@ -83,6 +85,7 @@ def _valid_validation_payload(model_hash: str, schema_hash: str) -> dict:
         "validation_background_samples": 10,
         "fp32_sha256": "b" * 64,
         "int8_sha256": model_hash,
+        "policy_sha256": policy_hash,
         "input_schema_sha256": schema_hash,
         "input_band_ids": ["band_01", "band_02", "band_03"],
         "preprocessing_version": 2,
@@ -169,7 +172,9 @@ def _write_candidate_artifacts(root: Path, marker: str) -> tuple[Path, Path, Pat
         )
     )
     validation = root / "validation.json"
-    validation.write_text(json.dumps(_valid_validation_payload(model_hash, schema_hash)))
+    validation.write_text(
+        json.dumps(_valid_validation_payload(model_hash, schema_hash, sha256_file(policy)))
+    )
     return model, policy, validation
 
 
@@ -203,6 +208,15 @@ def test_bundle_rejects_model_policy_mismatch(tmp_path: Path) -> None:
     payload["model_sha256"] = "f" * 64
     policy.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="different model"):
+        build_bundle(model, policy, validation, tmp_path / "bundle")
+
+
+def test_bundle_rejects_validation_policy_mismatch(tmp_path: Path) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "policy-evidence")
+    payload = json.loads(validation.read_text())
+    payload["policy_sha256"] = "f" * 64
+    validation.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="different calibration policy"):
         build_bundle(model, policy, validation, tmp_path / "bundle")
 
 
@@ -265,6 +279,15 @@ def test_bundle_recomputes_scientific_validation_checks(tmp_path: Path) -> None:
         build_bundle(model, policy, validation, tmp_path / "bundle")
 
 
+def test_bundle_build_rejects_output_overlapping_inputs(tmp_path: Path) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "unsafe-output")
+    with pytest.raises(ValueError, match="overlaps protected input"):
+        build_bundle(model, policy, validation, model.parent)
+    assert model.is_file()
+    assert policy.is_file()
+    assert validation.is_file()
+
+
 def test_failed_calibration_cannot_be_promoted(tmp_path: Path) -> None:
     model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "failed-calibration")
     payload = json.loads(policy.read_text())
@@ -286,6 +309,34 @@ def test_incomplete_or_corrupt_bundle_is_rejected(tmp_path: Path) -> None:
         verify_bundle(bundle)
 
 
+def test_runtime_bundle_verification_covers_validation_component(tmp_path: Path) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "runtime-bundle")
+    bundle = tmp_path / "bundle"
+    manifest = build_bundle(model, policy, validation, bundle)
+    schema = read_input_schema(bundle / "input_schema.json")
+    identity = resolve_artifact_identity(
+        bundle / "model.onnx",
+        bundle / "policy.json",
+        model_sha256=manifest["model_sha256"],
+        input_schema_sha256=manifest["input_contract_sha256"],
+        input_schema_path=bundle / "input_schema.json",
+        preprocessing_sha256=schema["preprocessing_sha256"],
+        explicit_bundle_id=manifest["bundle_id"],
+    )
+    assert identity["deployment_bundle_verified"] is True
+    (bundle / "validation.json").write_text("{}")
+    with pytest.raises(ValueError, match="validation component hash mismatch"):
+        resolve_artifact_identity(
+            bundle / "model.onnx",
+            bundle / "policy.json",
+            model_sha256=manifest["model_sha256"],
+            input_schema_sha256=manifest["input_contract_sha256"],
+            input_schema_path=bundle / "input_schema.json",
+            preprocessing_sha256=schema["preprocessing_sha256"],
+            explicit_bundle_id=manifest["bundle_id"],
+        )
+
+
 def test_orphaned_partial_state_file_does_not_change_active_bundle(tmp_path: Path) -> None:
     model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "partial-state")
     bundle = tmp_path / "bundle"
@@ -297,6 +348,39 @@ def test_orphaned_partial_state_file_does_not_change_active_bundle(tmp_path: Pat
     orphan.write_text("{partial")
     resolved = resolve_bundle(store, state)
     assert resolved["bundle_id"] == manifest["bundle_id"]
+
+
+def test_resolve_rejects_non_hex_state_bundle_id(tmp_path: Path) -> None:
+    state = tmp_path / "deployment_state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generation": 1,
+                "active_bundle_id": "z" * 64,
+                "previous_bundle_id": None,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="invalid active_bundle_id"):
+        resolve_bundle(tmp_path / "store", state)
+
+
+def test_promotion_rejects_corrupt_current_rollback_target(tmp_path: Path) -> None:
+    store = tmp_path / "store"
+    state = tmp_path / "deployment_state.json"
+    model_a, policy_a, validation_a = _write_candidate_artifacts(tmp_path / "a", "active-a")
+    bundle_a = tmp_path / "bundle-a"
+    manifest_a = build_bundle(model_a, policy_a, validation_a, bundle_a)
+    promote_bundle(bundle_a, store, state)
+
+    model_b, policy_b, validation_b = _write_candidate_artifacts(tmp_path / "b", "active-b")
+    bundle_b = tmp_path / "bundle-b"
+    build_bundle(model_b, policy_b, validation_b, bundle_b)
+
+    (store / manifest_a["bundle_id"] / "policy.json").write_text("{}")
+    with pytest.raises(ValueError, match="component hash mismatch"):
+        promote_bundle(bundle_b, store, state)
 
 
 def test_promoted_bundle_is_immutable_from_candidate_changes(tmp_path: Path) -> None:
@@ -320,16 +404,34 @@ def test_summarizer_rejects_input_contract_mismatch(tmp_path: Path) -> None:
     model_hash = "a" * 64
     schema_hash = "c" * 64
     test_records = [
-        {"file": "event/0.npy", "model_sha256": model_hash, "input_schema_sha256": schema_hash, "true_class": 1, "pred_class": 1, "prob_event": 0.9, "inference_ok": True, "latency_ms": 1.0},
+        {
+            "file": "event/0.npy",
+            "model_sha256": model_hash,
+            "input_schema_sha256": schema_hash,
+            "true_class": 1,
+            "pred_class": 1,
+            "prob_event": 0.9,
+            "inference_ok": True,
+            "latency_ms": 1.0,
+        },
     ]
     down_records = [
-        {"file": "event/0.npy", "model_sha256": model_hash, "input_schema_sha256": schema_hash, "kept": True, "decision": "event", "size_bytes": 100},
+        {
+            "file": "event/0.npy",
+            "model_sha256": model_hash,
+            "input_schema_sha256": schema_hash,
+            "kept": True,
+            "decision": "event",
+            "size_bytes": 100,
+        },
     ]
     test_log = tmp_path / "test.jsonl"
     down_log = tmp_path / "down.jsonl"
     test_log.write_text("".join(json.dumps(r) + "\n" for r in test_records))
     down_log.write_text("".join(json.dumps(r) + "\n" for r in down_records))
     calib = tmp_path / "calib.json"
-    calib.write_text(json.dumps({"model_sha256": model_hash, "input_schema_sha256": "d" * 64}))
+    calib.write_text(
+        json.dumps({"model_sha256": model_hash, "input_schema_sha256": "d" * 64})
+    )
     with pytest.raises(ValueError, match="schema differs"):
         summarize(test_log, down_log, calib)
