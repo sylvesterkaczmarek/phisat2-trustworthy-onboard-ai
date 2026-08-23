@@ -60,55 +60,161 @@ def main() -> None:
 
     run(
         [
-            python, "-m", "phi2_tile_filter.synth", "--out", str(tiles), "--n", str(args.n),
-            "--bands", str(args.bands), "--size", str(args.size), "--seed", str(args.seed),
-            "--train-fraction", str(args.train_fraction), "--calib-fraction", str(args.calib_fraction),
-            "--validation-fraction", str(args.validation_fraction), "--overwrite",
+            python,
+            "-m",
+            "phi2_tile_filter.synth",
+            "--out",
+            str(tiles),
+            "--n",
+            str(args.n),
+            "--bands",
+            str(args.bands),
+            "--size",
+            str(args.size),
+            "--seed",
+            str(args.seed),
+            "--train-fraction",
+            str(args.train_fraction),
+            "--calib-fraction",
+            str(args.calib_fraction),
+            "--validation-fraction",
+            str(args.validation_fraction),
+            "--overwrite",
         ],
         cwd=example_root,
     )
     run(
-        [python, "-m", "phi2_tile_filter.train", "--data", str(tiles), "--epochs", str(args.epochs), "--seed", str(args.seed), "--out", str(runs / "tinycnn.pt")],
+        [
+            python,
+            "-m",
+            "phi2_tile_filter.train",
+            "--data",
+            str(tiles),
+            "--epochs",
+            str(args.epochs),
+            "--seed",
+            str(args.seed),
+            "--out",
+            str(runs / "tinycnn.pt"),
+        ],
         cwd=example_root,
     )
     run(
-        [python, "-m", "phi2_tile_filter.export_onnx", "--weights", str(runs / "tinycnn.pt"), "--out", str(models / "tinycnn_fp32.onnx")],
+        [
+            python,
+            "-m",
+            "phi2_tile_filter.export_onnx",
+            "--weights",
+            str(runs / "tinycnn.pt"),
+            "--out",
+            str(models / "tinycnn_fp32.onnx"),
+        ],
         cwd=example_root,
     )
     run(
-        [python, "-m", "phi2_tile_filter.quantize_ptq", "--onnx", str(models / "tinycnn_fp32.onnx"), "--calib", str(tiles / "calib"), "--out", str(models / "tinycnn_int8.onnx")],
+        [
+            python,
+            "-m",
+            "phi2_tile_filter.quantize_ptq",
+            "--onnx",
+            str(models / "tinycnn_fp32.onnx"),
+            "--calib",
+            str(tiles / "calib"),
+            "--out",
+            str(models / "tinycnn_int8.onnx"),
+        ],
         cwd=example_root,
     )
 
     calibration_command = [
-        python, "-m", "phi2_tile_filter.calibrate_threshold", "--onnx", str(models / "tinycnn_int8.onnx"),
-        "--data", str(tiles / "calib"), "--target-recall", str(args.target_recall),
-        "--min-confidence", str(args.min_confidence), "--confidence-level", str(args.calibration_confidence_level),
-        "--quality-guard-quantile", str(args.quality_guard_quantile), "--quality-guard-margin", str(args.quality_guard_margin),
-        "--out", str(calibration),
+        python,
+        "-m",
+        "phi2_tile_filter.calibrate_threshold",
+        "--onnx",
+        str(models / "tinycnn_int8.onnx"),
+        "--data",
+        str(tiles / "calib"),
+        "--target-recall",
+        str(args.target_recall),
+        "--min-confidence",
+        str(args.min_confidence),
+        "--confidence-level",
+        str(args.calibration_confidence_level),
+        "--quality-guard-quantile",
+        str(args.quality_guard_quantile),
+        "--quality-guard-margin",
+        str(args.quality_guard_margin),
+        "--out",
+        str(calibration),
     ]
     if args.min_calibration_recall_lower_bound is not None:
-        calibration_command.extend(["--min-event-recall-lower-bound", str(args.min_calibration_recall_lower_bound)])
+        calibration_command.extend(
+            ["--min-event-recall-lower-bound", str(args.min_calibration_recall_lower_bound)]
+        )
     run(calibration_command, cwd=example_root)
 
     run(
         [
-            python, "-m", "phi2_tile_filter.validate_models", "--fp32", str(models / "tinycnn_fp32.onnx"),
-            "--int8", str(models / "tinycnn_int8.onnx"), "--data", str(tiles / "validation"), "--policy", str(calibration),
-            "--max-accuracy-drop", str(args.max_accuracy_drop), "--min-argmax-agreement", str(args.min_argmax_agreement),
-            "--max-event-recall-drop", str(args.max_event_recall_drop), "--max-event-fnr-increase", str(args.max_event_fnr_increase),
-            "--max-pr-auc-drop", str(args.max_pr_auc_drop), "--min-policy-decision-agreement", str(args.min_policy_decision_agreement),
-            "--max-event-retention-recall-drop", str(args.max_event_retention_recall_drop), "--max-event-score-drift", str(args.max_event_score_drift),
-            "--out", str(reports / "model_validation.json"),
+            python,
+            "-m",
+            "phi2_tile_filter.validate_models",
+            "--fp32",
+            str(models / "tinycnn_fp32.onnx"),
+            "--int8",
+            str(models / "tinycnn_int8.onnx"),
+            "--data",
+            str(tiles / "validation"),
+            "--policy",
+            str(calibration),
+            "--max-accuracy-drop",
+            str(args.max_accuracy_drop),
+            "--min-argmax-agreement",
+            str(args.min_argmax_agreement),
+            "--max-event-recall-drop",
+            str(args.max_event_recall_drop),
+            "--max-event-fnr-increase",
+            str(args.max_event_fnr_increase),
+            "--max-pr-auc-drop",
+            str(args.max_pr_auc_drop),
+            "--min-policy-decision-agreement",
+            str(args.min_policy_decision_agreement),
+            "--max-event-retention-recall-drop",
+            str(args.max_event_retention_recall_drop),
+            "--max-event-score-drift",
+            str(args.max_event_score_drift),
+            "--out",
+            str(reports / "model_validation.json"),
         ],
         cwd=example_root,
     )
     run(
-        [python, str(repo_root / "assurance" / "model_store.py"), "build", "--model", str(models / "tinycnn_int8.onnx"), "--policy", str(calibration), "--validation", str(reports / "model_validation.json"), "--out", str(candidate_bundle)],
+        [
+            python,
+            str(repo_root / "assurance" / "model_store.py"),
+            "build",
+            "--model",
+            str(models / "tinycnn_int8.onnx"),
+            "--policy",
+            str(calibration),
+            "--validation",
+            str(reports / "model_validation.json"),
+            "--out",
+            str(candidate_bundle),
+        ],
         cwd=repo_root,
     )
     run(
-        [python, str(repo_root / "assurance" / "model_store.py"), "promote", "--candidate-bundle", str(candidate_bundle), "--store", str(bundle_store), "--state", str(deployment_state)],
+        [
+            python,
+            str(repo_root / "assurance" / "model_store.py"),
+            "promote",
+            "--candidate-bundle",
+            str(candidate_bundle),
+            "--store",
+            str(bundle_store),
+            "--state",
+            str(deployment_state),
+        ],
         cwd=repo_root,
     )
 
@@ -117,16 +223,58 @@ def main() -> None:
     active_policy = Path(active["policy"])
     active_bundle_id = str(active["bundle_id"])
 
+    # The final test split is touched only after the candidate has passed calibration,
+    # validation, bundle verification, and promotion.
     run(
-        [python, str(repo_root / "assurance" / "telemetry_log.py"), "--onnx", str(active_model), "--data", str(tiles / "test"), "--policy", str(active_policy), "--bundle-id", active_bundle_id, "--out", str(logs / "test.jsonl")],
+        [
+            python,
+            str(repo_root / "assurance" / "telemetry_log.py"),
+            "--onnx",
+            str(active_model),
+            "--data",
+            str(tiles / "test"),
+            "--policy",
+            str(active_policy),
+            "--bundle-id",
+            active_bundle_id,
+            "--out",
+            str(logs / "test.jsonl"),
+        ],
         cwd=repo_root,
     )
     run(
-        [python, "-m", "phi2_tile_filter.bandwidth_filter", "--onnx", str(active_model), "--data", str(tiles / "test"), "--policy", str(active_policy), "--bundle-id", active_bundle_id, "--downlink-out", str(downlink), "--log", str(logs / "downlink.jsonl")],
+        [
+            python,
+            "-m",
+            "phi2_tile_filter.bandwidth_filter",
+            "--onnx",
+            str(active_model),
+            "--data",
+            str(tiles / "test"),
+            "--policy",
+            str(active_policy),
+            "--bundle-id",
+            active_bundle_id,
+            "--downlink-out",
+            str(downlink),
+            "--log",
+            str(logs / "downlink.jsonl"),
+        ],
         cwd=example_root,
     )
     run(
-        [python, str(repo_root / "assurance" / "summarize.py"), "--test-log", str(logs / "test.jsonl"), "--downlink-log", str(logs / "downlink.jsonl"), "--calib", str(active_policy), "--out-dir", str(reports)],
+        [
+            python,
+            str(repo_root / "assurance" / "summarize.py"),
+            "--test-log",
+            str(logs / "test.jsonl"),
+            "--downlink-log",
+            str(logs / "downlink.jsonl"),
+            "--calib",
+            str(active_policy),
+            "--out-dir",
+            str(reports),
+        ],
         cwd=repo_root,
     )
 
@@ -150,8 +298,12 @@ def main() -> None:
             "accepted": validation_result["accepted"],
             "acceptance_checks": validation_result["acceptance_checks"],
             "input_quality_guard_validation": validation_result.get("input_quality_guard_validation"),
-            "classification_quantization_regression": validation_result["classification_metrics"]["quantization_regression"],
-            "policy_quantization_regression": validation_result["policy_metrics"]["quantization_regression"],
+            "classification_quantization_regression": validation_result["classification_metrics"][
+                "quantization_regression"
+            ],
+            "policy_quantization_regression": validation_result["policy_metrics"][
+                "quantization_regression"
+            ],
             "score_drift_metrics": validation_result["score_drift_metrics"],
         },
         "final_test_metrics": final_test_metrics,
