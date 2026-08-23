@@ -47,6 +47,8 @@ The perturbations are simulation tools only. They are not calibrated models of P
 
 The benchmark runs the already deployed model and policy without retraining or recalibration. It reports each condition separately, including event retention, background rejection, retained fraction, fallback rate, input-quality guard trigger rate, preprocessing/inference failure rate, degradation/OOD detection rate, and source-file bytes retained/reduced.
 
+Before reporting, the robustness summarizer requires every telemetry record to use the same deployment bundle, model, policy, input contract, schema file, preprocessing fingerprint, and telemetry schema version. It also verifies the benchmark manifest's input contract and re-hashes each benchmark source file against the recorded input SHA-256 and size. Mixed or changed evidence is rejected rather than combined.
+
 ## Source-byte and prevalence reporting
 
 Byte accounting refers to bytes in the source tile files handled by the demonstrator. Metrics use names such as `source_bytes_total`, `source_bytes_retained`, and `source_bytes_reduction_fraction` or `_pct`.
@@ -63,9 +65,9 @@ The runtime records the failure stage and preserves any metadata that was succes
 
 ## Telemetry integrity
 
-Runtime and downlink JSONL records use an explicit telemetry schema version. New records include input-quality evidence as well as:
+Runtime and downlink JSONL records use an explicit telemetry schema version. Current schema version 6 records include input-quality evidence and host timing evidence as well as:
 
-- deployment bundle ID and whether the local bundle manifest was verified;
+- deployment bundle ID and whether the complete local bundle manifest/components were verified;
 - ONNX model SHA-256;
 - calibration-policy file SHA-256;
 - semantic input/preprocessing contract SHA-256;
@@ -73,13 +75,14 @@ Runtime and downlink JSONL records use an explicit telemetry schema version. New
 - preprocessing fingerprint;
 - per-input file SHA-256 and observed size;
 - inference status, failure stage, policy decision, and retention request;
-- input-quality guard method, score, threshold, and in/out-of-region decision when enabled.
+- input-quality guard method, score, threshold, and in/out-of-region decision when enabled;
+- execution provider and separate observation, preprocessing, input-quality, ONNX, policy, and end-to-end host wall-clock timing.
 
 Downlink records additionally state whether retention was actually materialised and the SHA-256 of the copied file. A copied file is rejected if its hash differs from the input hash observed during evaluation.
 
-The final summarizer validates every record against the telemetry schema, rejects duplicate file entries, and requires final-test and downlink logs to agree on file set, per-file input hash and size, bundle, model, policy, input schema, and preprocessing identity. The SHA-256 of the calibration-policy file supplied to the summarizer must equal the policy hash recorded in both logs. If an input could not be stably hashed, the runtime can still emit conservative failure telemetry, but the scientific summarizer refuses to claim fully reconciled final metrics for that run.
+A runtime record only marks `deployment_bundle_verified` true after checking the complete local bundle manifest identity and all four component hashes, including validation evidence. The final summarizer validates every record against the telemetry schema, rejects duplicate file entries, and requires final-test and downlink logs to agree on file set, per-file input hash and size, bundle, model, policy, input schema, and preprocessing identity. The SHA-256 of the calibration-policy file supplied to the summarizer must equal the policy hash recorded in both logs. If an input could not be stably hashed, the runtime can still emit conservative failure telemetry, but the scientific summarizer refuses to claim fully reconciled final metrics for that run.
 
-Telemetry schema version 5 is emitted by the current runtime. The validator retains read compatibility with version 4 records for existing archived runs; version 4 simply has no input-quality evidence.
+Telemetry schema version 6 is emitted by the current runtime. The validator retains read compatibility with versions 4 and 5 for archived runs; version 4 predates input-quality evidence and version 5 predates the explicit timing breakdown.
 
 ## Calibration uncertainty
 
@@ -95,25 +98,27 @@ FP32 and INT8 acceptance is evaluated only on the validation split, using the po
 
 The validation report separates model classification metrics, quantization regressions, event-score drift, calibrated retention metrics, and FP32/INT8 agreement on the actual retain/discard decision. It also records how often the input-quality guard flags nominal validation samples.
 
-Configurable gates cover accuracy drop, event-recall drop, false-negative-rate increase, PR-AUC drop, argmax agreement, retain/discard agreement, event-retention-recall drop, and event-score drift. The bundle verifier recomputes those acceptance checks before accepting the report as deployment evidence.
+Configurable gates cover accuracy drop, event-recall drop, false-negative-rate increase, PR-AUC drop, argmax agreement, retain/discard agreement, event-retention-recall drop, and event-score drift. Validation evidence records the SHA-256 of the exact calibration-policy artifact used to calculate policy behaviour. The bundle verifier recomputes the acceptance checks and refuses a validation report whose policy hash differs from the policy being bundled.
 
 ## Deployment bundles
 
 A deployable candidate is an immutable directory containing `model.onnx`, `policy.json`, `input_schema.json`, `validation.json`, and `bundle.json`.
 
-The policy file is hashed as a bundle component, so the calibrated input-quality guard and its threshold are cryptographically bound to the deployed model, input contract, and validation evidence. Bundle creation validates either legacy policy schema 4 or current schema 5; schema 5 must contain a structurally valid quality guard.
+The policy file is hashed as a bundle component, so the calibrated input-quality guard and its threshold are cryptographically bound to the deployed model and input contract. Validation evidence is separately bound to the exact policy SHA-256, preventing accepted evidence from one threshold/confidence/quality-guard configuration from being reused with another policy for the same model.
+
+Bundle creation validates either legacy policy schema 4 or current schema 5; schema 5 must contain a structurally valid quality guard. Bundle build output is subject to the same destructive-path safety rules as other tree-replacement workflows and cannot overlap the model, policy, schema, or validation inputs.
 
 ## Promotion and rollback
 
 Validated bundles are copied into a content-addressed store under their `bundle_id`. Stored bundles are immutable. Deployment state is held in `deployment_state.json` with active/previous bundle IDs and a monotonically increasing generation number.
 
-Promotion verifies the candidate completely before atomically replacing the deployment-state pointer. Rollback swaps complete bundle identifiers, so model, policy, quality guard, preprocessing metadata, and validation evidence move together.
+Deployment-state bundle identifiers must be valid SHA-256 hex strings and must exactly match the selected bundle manifest. Promotion verifies both the new candidate and the currently active stored bundle before changing the state pointer, so a corrupted current deployment is not silently preserved as the claimed rollback target. Rollback verifies both bundles before swapping complete identifiers, so model, policy, quality guard, preprocessing metadata, and validation evidence move together.
 
 ## Filesystem safety
 
 Commands that replace directory trees validate their destinations before recursive mutation. The exact filesystem root, home directory, current working directory, and system temporary-directory root are rejected as recursive replacement targets. Input and output trees must be fully disjoint.
 
-The synthetic generator, robustness benchmark, and downlink filter build complete outputs in sibling staging directories and only replace destinations after successful work. Existing output is preserved when generation or processing fails before the final swap.
+The synthetic generator, robustness benchmark, downlink filter, and deployment-bundle builder use guarded destinations; the generated data/downlink workflows build complete outputs in sibling staging directories and only replace destinations after successful work. Existing output is preserved when generation or processing fails before the final swap.
 
 ## Watchdog
 
@@ -128,7 +133,7 @@ The main demonstration follows this order:
 3. export and validate FP32 ONNX;
 4. quantize to INT8 using calibration data;
 5. calibrate threshold, temperature, recall evidence, and input-quality guard on `calib`;
-6. evaluate FP32/INT8 and policy regressions on `validation` only;
+6. evaluate FP32/INT8 and policy regressions on `validation` only, binding the report to the exact policy artifact;
 7. build and verify the deployment bundle;
 8. promote the complete bundle;
 9. emit final-test telemetry from the verified active bundle;
