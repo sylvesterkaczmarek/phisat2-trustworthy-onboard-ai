@@ -58,4 +58,32 @@ jobs:
         run: >-
           python scripts/run_demo.py
           --n 96 --size 32 --bands 7 --epochs 1 --seed 0
-          --output-root /tmp/phi2-demo
+          --output-root /tmp/phi2-demo-a
+      - name: Repeat seeded demo
+        if: matrix.run-smoke
+        working-directory: examples/phi2-eo-tile-filter
+        run: >-
+          python scripts/run_demo.py
+          --n 96 --size 32 --bands 7 --epochs 1 --seed 0
+          --output-root /tmp/phi2-demo-b
+      - name: Verify deterministic scientific outputs
+        if: matrix.run-smoke
+        working-directory: examples/phi2-eo-tile-filter
+        run: >-
+          python scripts/check_reproducibility.py
+          /tmp/phi2-demo-a /tmp/phi2-demo-b
+      - name: Robustness benchmark smoke
+        if: matrix.run-smoke
+        working-directory: examples/phi2-eo-tile-filter
+        run: >-
+          python scripts/run_robustness_benchmark.py
+          --output-root /tmp/phi2-demo-a
+          --samples-per-category 2
+          --seed 101
+          --event-prevalences 0.01,0.05,0.10
+      - name: Verify robustness artifacts
+        if: matrix.run-smoke
+        working-directory: examples/phi2-eo-tile-filter
+        run: >-
+          python scripts/check_robustness_outputs.py
+          /tmp/phi2-demo-a --samples-per-category 2
