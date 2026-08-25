@@ -8,7 +8,7 @@ from pathlib import Path
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verify robustness benchmark smoke artifacts.")
     parser.add_argument("root", type=Path)
-    parser.add_argument("--samples-per-category", type=int, default=2)
+    parser.add_argument("--samples-per-category", type=int, default=4)
     args = parser.parse_args()
 
     root = args.root.resolve()
