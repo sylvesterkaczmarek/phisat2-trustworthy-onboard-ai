@@ -78,7 +78,7 @@ jobs:
         run: >-
           python scripts/run_robustness_benchmark.py
           --output-root /tmp/phi2-demo-a
-          --samples-per-category 2
+          --samples-per-category 4
           --seed 101
           --event-prevalences 0.01,0.05,0.10
       - name: Verify robustness artifacts
@@ -86,4 +86,4 @@ jobs:
         working-directory: examples/phi2-eo-tile-filter
         run: >-
           python scripts/check_robustness_outputs.py
-          /tmp/phi2-demo-a --samples-per-category 2
+          /tmp/phi2-demo-a --samples-per-category 4
