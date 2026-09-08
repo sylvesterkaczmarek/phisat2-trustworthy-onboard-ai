@@ -26,9 +26,28 @@ def assert_paths_disjoint(
     """Reject equal, ancestor, or descendant path relationships."""
     a = _resolved(first)
     b = _resolved(second)
-    if a == b or a in b.parents or b in a.parents:
+    if (
+        a == b
+        or a in b.parents
+        or b in a.parents
+        or (a.exists() and b.exists() and a.samefile(b))
+    ):
         raise ValueError(f"unsafe overlapping {description}: {a} and {b}")
     return a, b
+
+
+def assert_file_outputs_disjoint(
+    outputs: Iterable[str | Path], *, protected_paths: Iterable[str | Path] = ()
+) -> tuple[Path, ...]:
+    """Validate output files against one another and their protected inputs."""
+    resolved = tuple(_resolved(path) for path in outputs)
+    protected = tuple(_resolved(path) for path in protected_paths)
+    for index, path in enumerate(resolved):
+        if path.exists() and not path.is_file():
+            raise ValueError(f"output must be a file: {path}")
+        for other in (*resolved[:index], *protected):
+            assert_paths_disjoint(path, other, description="output/input paths")
+    return resolved
 
 
 def assert_safe_tree_target(
@@ -116,6 +135,48 @@ def replace_tree_from_stage(stage: str | Path, destination: str | Path) -> None:
                 backup.unlink()
 
 
+def replace_outputs_from_stages(
+    outputs: Iterable[tuple[str | Path, str | Path]],
+) -> None:
+    """Publish related outputs, restoring all previous outputs if a rename fails.
+
+    Each stage must be a sibling of its destination. This handles ordinary
+    publication failures; several filesystem renames are not a crash-atomic
+    transaction and readers should wait for the command to finish.
+    """
+    pairs = [(_resolved(stage), _resolved(destination)) for stage, destination in outputs]
+    for stage, destination in pairs:
+        if stage.parent != destination.parent:
+            raise ValueError("staged output must be a sibling of its destination")
+        if not stage.exists():
+            raise FileNotFoundError(f"staged output does not exist: {stage}")
+    all_paths = [path for pair in pairs for path in pair]
+    for index, path in enumerate(all_paths):
+        for other in all_paths[index + 1 :]:
+            assert_paths_disjoint(path, other, description="staged publication paths")
+
+    backups: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        for _, destination in pairs:
+            if destination.exists():
+                backup = sibling_stage_path(destination, label="backup")
+                os.replace(destination, backup)
+                backups.append((backup, destination))
+        for stage, destination in pairs:
+            os.replace(stage, destination)
+            published.append(destination)
+    except BaseException:
+        for destination in reversed(published):
+            remove_stage(destination)
+        for backup, destination in reversed(backups):
+            os.replace(backup, destination)
+        raise
+    else:
+        for backup, _ in backups:
+            remove_stage(backup)
+
+
 @contextmanager
 def staged_text_file(path: str | Path) -> Iterator[TextIO]:
     """Write a text file completely before atomically replacing its destination."""
@@ -127,10 +188,7 @@ def staged_text_file(path: str | Path) -> Iterator[TextIO]:
         handle = stage.open("w", encoding="utf-8")
         yield handle
         handle.flush()
-        try:
-            os.fsync(handle.fileno())
-        except OSError:
-            pass
+        os.fsync(handle.fileno())
         handle.close()
         handle = None
         os.replace(stage, destination)

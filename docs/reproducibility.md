@@ -62,6 +62,15 @@ The main generator creates independent `train`, `calib`, `validation`, and `test
 
 The optional robustness benchmark is generated only after deployment and never participates in candidate selection. Its seed controls nominal, degraded, corrupted, and OOD sample generation, and its manifest records the perturbation configuration and each sample's category/recipe.
 
+Manifest validation checks declared split roles and counts. It does not prove
+independence of externally supplied tile content; assess duplicate samples and
+data leakage separately when replacing the synthetic generator.
+
+PNG/JPEG schemas require HWC source layout; NumPy also supports CHW. Source
+arrays must be real-valued, and unsupported normalisation parameters are
+rejected. An explicitly requested missing schema causes an error instead of
+selecting another schema automatically.
+
 ## Reproducing a complete run
 
 ```bash

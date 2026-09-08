@@ -17,8 +17,8 @@ def input_quality_features(array_chw: np.ndarray) -> tuple[np.ndarray, tuple[str
     not a physical sensor model.
     """
     x = np.asarray(array_chw)
-    if x.ndim != 3:
-        raise ValueError(f"quality guard expects CHW input, got shape {x.shape}")
+    if x.ndim != 3 or any(size == 0 for size in x.shape):
+        raise ValueError(f"quality guard expects non-empty CHW input, got shape {x.shape}")
     if x.dtype != np.float32:
         raise ValueError(f"quality guard expects float32 input, got {x.dtype}")
     if not np.all(np.isfinite(x)):
@@ -80,8 +80,18 @@ class InputQualityGuard:
             raise ValueError("quality guard threshold_quantile must be in (0, 1]")
         if not np.isfinite(self.threshold_margin) or self.threshold_margin < 1.0:
             raise ValueError("quality guard threshold_margin must be >= 1")
-        if self.calibration_samples <= 0:
+        if (
+            isinstance(self.calibration_samples, (bool, np.bool_))
+            or not isinstance(self.calibration_samples, (int, np.integer))
+            or self.calibration_samples <= 0
+        ):
             raise ValueError("quality guard requires calibration samples")
+        if (
+            not np.isfinite(self.calibration_score_median)
+            or not np.isfinite(self.calibration_score_max)
+            or not 0.0 <= self.calibration_score_median <= self.calibration_score_max
+        ):
+            raise ValueError("quality guard calibration scores must be finite, non-negative and ordered")
 
     def score(self, array_chw: np.ndarray) -> float:
         features, names = input_quality_features(array_chw)
@@ -89,8 +99,12 @@ class InputQualityGuard:
             raise ValueError("quality guard feature definition does not match input band count")
         center = np.asarray(self.center, dtype=np.float64)
         scale = np.asarray(self.scale, dtype=np.float64)
-        z = (features - center) / scale
-        return float(np.sqrt(np.mean(np.square(z))))
+        with np.errstate(over="ignore", invalid="ignore"):
+            z = (features - center) / scale
+            score = float(np.sqrt(np.mean(np.square(z))))
+        if not np.isfinite(score):
+            raise ValueError("quality guard score exceeds the finite numerical range")
+        return score
 
     def assess(self, array_chw: np.ndarray) -> InputQualityAssessment:
         score = self.score(array_chw)
@@ -117,11 +131,32 @@ class InputQualityGuard:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "InputQualityGuard":
-        if not isinstance(payload, dict) or payload.get("schema_version") != QUALITY_GUARD_SCHEMA_VERSION:
+        if (
+            not isinstance(payload, dict)
+            or type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != QUALITY_GUARD_SCHEMA_VERSION
+        ):
             raise ValueError("unsupported input quality guard schema")
         try:
+            if type(payload["calibration_samples"]) is not int:
+                raise ValueError("calibration_samples must be an integer")
+            for key in ("center", "scale"):
+                if not isinstance(payload[key], list) or any(
+                    type(value) not in (int, float) for value in payload[key]
+                ):
+                    raise ValueError(f"{key} must be a list of numbers")
+            for key in (
+                "threshold", "threshold_quantile", "threshold_margin",
+                "calibration_score_median", "calibration_score_max",
+            ):
+                if type(payload[key]) not in (int, float):
+                    raise ValueError(f"{key} must be a number")
+            if not isinstance(payload["feature_names"], list) or any(
+                not isinstance(value, str) or not value for value in payload["feature_names"]
+            ):
+                raise ValueError("feature_names must be a list of non-empty strings")
             return cls(
-                feature_names=tuple(str(value) for value in payload["feature_names"]),
+                feature_names=tuple(payload["feature_names"]),
                 center=tuple(float(value) for value in payload["center"]),
                 scale=tuple(float(value) for value in payload["scale"]),
                 threshold=float(payload["threshold"]),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import string
@@ -17,7 +18,10 @@ EXAMPLE_SRC = REPO_ROOT / "examples" / "phi2-eo-tile-filter" / "src"
 if str(EXAMPLE_SRC) not in sys.path:
     sys.path.insert(0, str(EXAMPLE_SRC))
 
-from phi2_tile_filter.filesystem import assert_safe_tree_target  # noqa: E402
+from phi2_tile_filter.filesystem import (  # noqa: E402
+    assert_safe_tree_target,
+    replace_tree_from_stage,
+)
 from phi2_tile_filter.input_schema import (  # noqa: E402
     band_ids,
     find_model_input_schema,
@@ -42,6 +46,19 @@ def sha256_file(path: str | Path) -> str:
 
 def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value.lower()) <= _HEX
+
+
+def _finite_number(value: Any, label: str, lower: float, upper: float) -> float:
+    message = f"{label} must be a finite number in [{lower}, {upper}]"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(message)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(result) or not lower <= result <= upper:
+        raise ValueError(message)
+    return result
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:
@@ -138,7 +155,10 @@ def _validate_policy(
     if int(policy.get("bands", -1)) != bands or int(policy.get("size", -1)) != size:
         raise ValueError("calibration policy input shape does not match model")
     for key in ("event_threshold", "min_confidence", "temperature"):
-        value = float(policy[key])
+        value = _finite_number(
+            policy[key], f"calibration policy {key}", 0.0,
+            math.inf if key == "temperature" else 1.0,
+        )
         if key == "temperature" and value <= 0:
             raise ValueError("calibration policy temperature must be positive")
         if key != "temperature" and not 0 <= value <= 1:
@@ -147,16 +167,52 @@ def _validate_policy(
     acceptance = policy.get("calibration_acceptance")
     if not isinstance(stats, dict) or not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
         raise ValueError("calibration policy is not marked accepted")
-    lower = float(stats["event_recall_lower_bound"])
-    empirical = float(stats["empirical_event_recall"])
-    confidence = float(stats["event_recall_confidence_level"])
-    if not 0 <= lower <= empirical <= 1 or not 0 < confidence < 1 or int(stats["event_samples"]) <= 0:
+    lower = _finite_number(stats["event_recall_lower_bound"], "calibration policy recall bound", 0.0, 1.0)
+    empirical = _finite_number(stats["empirical_event_recall"], "calibration policy recall", 0.0, 1.0)
+    confidence = _finite_number(stats["event_recall_confidence_level"], "calibration policy confidence", 0.0, 1.0)
+    trials = stats.get("event_samples")
+    if (
+        not lower <= empirical
+        or not 0 < confidence < 1
+        or isinstance(trials, bool)
+        or not isinstance(trials, int)
+        or trials <= 0
+    ):
         raise ValueError("calibration policy recall-bound metadata is inconsistent")
-    if stats.get("event_recall_bound_method") != "clopper-pearson-one-sided-exact":
+    method = stats.get("event_recall_bound_method")
+    if method == "order-statistic-one-sided-exact":
+        from scipy.stats import beta
+
+        counts = {}
+        for key in ("event_samples", "event_captures", "event_recall_bound_selection_rank"):
+            value = stats.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"calibration policy {key} must be an integer")
+            counts[key] = value
+        trials = counts["event_samples"]
+        captures = counts["event_captures"]
+        rank = counts["event_recall_bound_selection_rank"]
+        target = _finite_number(
+            stats.get("target_event_recall_for_threshold_selection"),
+            "calibration target event recall", 0.0, 1.0,
+        )
+        if (
+            target <= 0
+            or not 1 <= rank <= captures <= trials
+            or rank != max(1, math.ceil(target * trials))
+            or not math.isclose(empirical, captures / trials, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            raise ValueError("calibration policy order-statistic rank/count metadata is inconsistent")
+        expected_lower = float(beta.ppf(1.0 - confidence, rank, trials - rank + 1))
+        if not math.isclose(lower, expected_lower, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("calibration policy recall lower bound does not match its selection rank")
+    elif method != "clopper-pearson-one-sided-exact":
         raise ValueError("unsupported calibration recall-bound method")
     required = acceptance.get("required_min_event_recall_lower_bound")
-    if required is not None and lower < float(required):
-        raise ValueError("calibration policy does not meet its recall lower-bound requirement")
+    if required is not None:
+        required = _finite_number(required, "calibration recall lower-bound requirement", 0.0, 1.0)
+        if lower < required:
+            raise ValueError("calibration policy does not meet its recall lower-bound requirement")
     if schema_version == 5:
         InputQualityGuard.from_payload(policy.get("input_quality_guard"))
 
@@ -189,25 +245,33 @@ def _validate_validation(
         policy = report["policy_metrics"]["quantization_regression"]
         drift = report["score_drift_metrics"]
         criteria = report["acceptance_criteria"]
+        # Validate the domains before evaluating acceptance. Infinity, booleans,
+        # and numeric strings must not turn malformed evidence into a pass.
+        def metric(payload: dict, key: str, *, lower: float = -1.0) -> float:
+            return _finite_number(payload[key], f"validation metric {key}", lower, 1.0)
+
+        def criterion(key: str) -> float:
+            return _finite_number(criteria[key], f"validation acceptance criterion {key}", 0.0, 1.0)
+
         expected = {
-            "classification_accuracy_drop": float(classification["accuracy_drop"])
-            <= float(criteria["max_classification_accuracy_drop"]),
-            "classification_argmax_agreement": float(classification["argmax_agreement"])
-            >= float(criteria["min_classification_argmax_agreement"]),
-            "classification_event_recall_drop": float(classification["event_recall_drop"])
-            <= float(criteria["max_classification_event_recall_drop"]),
-            "classification_event_false_negative_rate_increase": float(
-                classification["event_false_negative_rate_increase"]
+            "classification_accuracy_drop": metric(classification, "accuracy_drop")
+            <= criterion("max_classification_accuracy_drop"),
+            "classification_argmax_agreement": metric(classification, "argmax_agreement", lower=0.0)
+            >= criterion("min_classification_argmax_agreement"),
+            "classification_event_recall_drop": metric(classification, "event_recall_drop")
+            <= criterion("max_classification_event_recall_drop"),
+            "classification_event_false_negative_rate_increase": metric(
+                classification, "event_false_negative_rate_increase"
             )
-            <= float(criteria["max_classification_event_false_negative_rate_increase"]),
-            "classification_pr_auc_drop": float(classification["pr_auc_drop"])
-            <= float(criteria["max_classification_pr_auc_drop"]),
-            "policy_retention_decision_agreement": float(policy["retention_decision_agreement"])
-            >= float(criteria["min_policy_retention_decision_agreement"]),
-            "policy_event_retention_recall_drop": float(policy["event_retention_recall_drop"])
-            <= float(criteria["max_policy_event_retention_recall_drop"]),
-            "event_score_drift": float(drift["max_absolute_event_score_drift"])
-            <= float(criteria["max_event_score_drift"]),
+            <= criterion("max_classification_event_false_negative_rate_increase"),
+            "classification_pr_auc_drop": metric(classification, "pr_auc_drop")
+            <= criterion("max_classification_pr_auc_drop"),
+            "policy_retention_decision_agreement": metric(policy, "retention_decision_agreement", lower=0.0)
+            >= criterion("min_policy_retention_decision_agreement"),
+            "policy_event_retention_recall_drop": metric(policy, "event_retention_recall_drop")
+            <= criterion("max_policy_event_retention_recall_drop"),
+            "event_score_drift": metric(drift, "max_absolute_event_score_drift", lower=0.0)
+            <= criterion("max_event_score_drift"),
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("validation report is missing required scientific acceptance metrics") from exc
@@ -356,9 +420,7 @@ def build_bundle(
         )
         verify_bundle(stage)
         _fsync_tree(stage)
-        if output.exists():
-            shutil.rmtree(output) if output.is_dir() else output.unlink()
-        os.replace(stage, output)
+        replace_tree_from_stage(stage, output)
         _fsync_dir(output.parent)
         return verify_bundle(output)
     finally:
@@ -370,7 +432,8 @@ def _copy_bundle(candidate: Path, store: Path, bundle_id: str) -> Path:
     store.mkdir(parents=True, exist_ok=True)
     destination = store / bundle_id
     if destination.exists():
-        verify_bundle(destination)
+        if verify_bundle(destination).get("bundle_id") != bundle_id:
+            raise ValueError("stored bundle identity does not match its directory")
         return destination
     stage = store / f".{bundle_id}.stage-{uuid.uuid4().hex}"
     shutil.copytree(candidate, stage)
@@ -454,15 +517,20 @@ def rollback(store: str | Path, state_path: str | Path) -> dict[str, Any]:
     if not _is_sha256(previous):
         raise FileNotFoundError("no previous deployment bundle is available")
     active = str(state["active_bundle_id"])
-    active_manifest = verify_bundle(store / active)
     previous_manifest = verify_bundle(store / str(previous))
-    if active_manifest.get("bundle_id") != active or previous_manifest.get("bundle_id") != previous:
+    if previous_manifest.get("bundle_id") != previous:
         raise ValueError("deployment state does not match stored bundle identity")
+    # Recovery must remain possible when the active deployment itself is damaged.
+    # Keep a usable active bundle as the next rollback target, never a corrupt one.
+    try:
+        active_usable = verify_bundle(store / active).get("bundle_id") == active
+    except Exception:
+        active_usable = False
     next_state = {
         "schema_version": 1,
         "generation": int(state["generation"]) + 1,
         "active_bundle_id": previous,
-        "previous_bundle_id": active,
+        "previous_bundle_id": active if active_usable else None,
         "updated_unix_s": time.time(),
     }
     _atomic_state(state_path, next_state)

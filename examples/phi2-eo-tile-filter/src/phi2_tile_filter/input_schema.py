@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
@@ -11,6 +12,18 @@ PREPROCESSING_NAME = "phi2_tile_filter.utils.load_tile_numpy"
 PREPROCESSING_VERSION = 2
 SUPPORTED_SOURCE_LAYOUTS = {"HWC", "CHW"}
 SUPPORTED_SOURCE_FORMATS = {"npy", "png", "jpeg"}
+
+
+def _finite_number(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite number")
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{field} must be a finite number") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be a finite number")
+    return result
 
 
 def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
@@ -37,7 +50,7 @@ def input_schema_sha256(payload: dict[str, Any]) -> str:
 
 
 def default_band_metadata(count: int) -> list[dict[str, Any]]:
-    if count <= 0:
+    if type(count) is not int or count <= 0:
         raise ValueError("band count must be positive")
     return [
         {
@@ -65,7 +78,11 @@ def build_input_schema(
     nodata_policy: str = "reject",
 ) -> dict[str, Any]:
     width = height if width is None else width
+    if any(type(value) is not int or value <= 0 for value in (bands, height, width)):
+        raise ValueError("band count and tile dimensions must be positive integers")
     metadata = list(default_band_metadata(bands) if band_metadata is None else deepcopy(list(band_metadata)))
+    if len(metadata) != bands:
+        raise ValueError("band metadata count must match bands")
     payload = {
         "schema_version": INPUT_SCHEMA_VERSION,
         "contract_type": "eo-input-preprocessing",
@@ -131,12 +148,12 @@ def _validate_band_metadata(bands: Any) -> None:
         wavelength_range = band.get("wavelength_range_nm")
         if wavelength_nm is not None and wavelength_range is not None:
             raise ValueError("a band may define wavelength_nm or wavelength_range_nm, not both")
-        if wavelength_nm is not None and float(wavelength_nm) <= 0.0:
+        if wavelength_nm is not None and _finite_number(wavelength_nm, "band wavelength_nm") <= 0.0:
             raise ValueError("band wavelength_nm must be positive")
         if wavelength_range is not None:
             if not isinstance(wavelength_range, list) or len(wavelength_range) != 2:
                 raise ValueError("band wavelength_range_nm must contain [min, max]")
-            low, high = map(float, wavelength_range)
+            low, high = (_finite_number(value, "band wavelength_range_nm") for value in wavelength_range)
             if low <= 0.0 or high <= low:
                 raise ValueError("band wavelength_range_nm must be positive and increasing")
 
@@ -161,13 +178,9 @@ def validate_input_schema(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("model tensor layout must be NCHW")
     if tensor.get("source_layout") not in SUPPORTED_SOURCE_LAYOUTS:
         raise ValueError("source layout must be HWC or CHW")
-    try:
-        height = int(tensor["height"])
-        width = int(tensor["width"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("input schema tile dimensions are invalid") from exc
-    if height <= 0 or width <= 0:
-        raise ValueError("input schema tile dimensions must be positive")
+    dimensions = (tensor.get("height"), tensor.get("width"))
+    if any(type(value) is not int or value <= 0 for value in dimensions):
+        raise ValueError("input schema tile dimensions must be positive integers")
     if tensor.get("dtype") != "float32":
         raise ValueError("model tensor dtype must be float32")
     _validate_band_metadata(tensor.get("bands"))
@@ -175,18 +188,20 @@ def validate_input_schema(payload: dict[str, Any]) -> dict[str, Any]:
     source_format = source.get("format")
     if source_format not in SUPPORTED_SOURCE_FORMATS:
         raise ValueError("source format must be one of npy, png, or jpeg")
+    if source_format in {"png", "jpeg"} and tensor["source_layout"] != "HWC":
+        raise ValueError("PNG/JPEG source layout must be HWC, matching decoded image channels")
     if not isinstance(source.get("dtype"), str) or not source["dtype"]:
         raise ValueError("input schema source dtype is required")
     value_range = source.get("value_range")
     if not isinstance(value_range, list) or len(value_range) != 2:
         raise ValueError("input schema source value_range must contain [min, max]")
-    low, high = map(float, value_range)
+    low, high = (_finite_number(value, "input schema source value_range") for value in value_range)
     if not low < high:
         raise ValueError("input schema source value_range must be increasing")
 
     if not isinstance(normalization.get("name"), str) or not normalization["name"]:
         raise ValueError("input schema normalization name is required")
-    if not isinstance(normalization.get("version"), int) or normalization["version"] <= 0:
+    if type(normalization.get("version")) is not int or normalization["version"] <= 0:
         raise ValueError("input schema normalization version must be a positive integer")
     if not isinstance(normalization.get("parameters", {}), dict):
         raise ValueError("input schema normalization parameters must be an object")
@@ -197,6 +212,8 @@ def validate_input_schema(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("this preprocessing implementation requires non-finite values to be rejected")
     if not isinstance(nodata.get("values"), list):
         raise ValueError("nodata values must be a list")
+    for value in nodata["values"]:
+        _finite_number(value, "nodata value")
 
     if preprocessing.get("name") != PREPROCESSING_NAME:
         raise ValueError("input schema preprocessing implementation does not match this runtime")
@@ -244,7 +261,10 @@ def find_model_input_schema(model_path: str | Path, explicit_path: str | Path | 
     model_path = Path(model_path)
     candidates: list[Path] = []
     if explicit_path is not None:
-        candidates.append(Path(explicit_path))
+        explicit = Path(explicit_path)
+        if not explicit.is_file():
+            raise FileNotFoundError(f"explicit input schema not found: {explicit}")
+        return explicit
     candidates.extend([model_path.parent / "input_schema.json", model_schema_sidecar_path(model_path)])
     for candidate in candidates:
         if candidate.is_file():

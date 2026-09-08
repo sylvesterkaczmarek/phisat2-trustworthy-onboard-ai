@@ -435,3 +435,292 @@ def test_summarizer_rejects_input_contract_mismatch(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="schema differs"):
         summarize(test_log, down_log, calib)
+
+
+def test_rollback_recovers_from_corrupt_active_without_retaining_it(tmp_path: Path) -> None:
+    store, state = tmp_path / "store", tmp_path / "state.json"
+    bundle_a, bundle_b = tmp_path / "bundle-a", tmp_path / "bundle-b"
+    manifest_a = build_bundle(*_write_candidate_artifacts(tmp_path / "a", "a"), bundle_a)
+    manifest_b = build_bundle(*_write_candidate_artifacts(tmp_path / "b", "b"), bundle_b)
+    promote_bundle(bundle_a, store, state)
+    previous_state = promote_bundle(bundle_b, store, state)
+    damaged_file = store / manifest_b["bundle_id"] / "model.onnx"
+    damaged_file.write_bytes(b"damaged deployment")
+
+    recovered = rollback(store, state)
+
+    assert recovered["generation"] == previous_state["generation"] + 1
+    assert recovered["active_bundle_id"] == manifest_a["bundle_id"]
+    assert recovered["previous_bundle_id"] is None
+    assert resolve_bundle(store, state)["bundle_id"] == manifest_a["bundle_id"]
+    assert damaged_file.read_bytes() == b"damaged deployment"
+    with pytest.raises(FileNotFoundError, match="no previous"):
+        rollback(store, state)
+
+
+def test_rollback_rejects_corrupt_previous_without_changing_state(tmp_path: Path) -> None:
+    store, state = tmp_path / "store", tmp_path / "state.json"
+    bundle_a, bundle_b = tmp_path / "bundle-a", tmp_path / "bundle-b"
+    manifest_a = build_bundle(*_write_candidate_artifacts(tmp_path / "a", "a"), bundle_a)
+    build_bundle(*_write_candidate_artifacts(tmp_path / "b", "b"), bundle_b)
+    promote_bundle(bundle_a, store, state)
+    promote_bundle(bundle_b, store, state)
+    before = state.read_bytes()
+    (store / manifest_a["bundle_id"] / "model.onnx").write_bytes(b"damaged rollback target")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        rollback(store, state)
+    assert state.read_bytes() == before
+
+
+def test_promotion_rejects_wrong_cached_bundle_before_state_changes(tmp_path: Path) -> None:
+    import shutil
+
+    store, state = tmp_path / "store", tmp_path / "state.json"
+    bundle_a, bundle_b = tmp_path / "bundle-a", tmp_path / "bundle-b"
+    build_bundle(*_write_candidate_artifacts(tmp_path / "a", "a"), bundle_a)
+    manifest_b = build_bundle(*_write_candidate_artifacts(tmp_path / "b", "b"), bundle_b)
+    promote_bundle(bundle_a, store, state)
+    before = state.read_bytes()
+    shutil.copytree(bundle_a, store / manifest_b["bundle_id"])
+    with pytest.raises(ValueError, match="identity"):
+        promote_bundle(bundle_b, store, state)
+    assert state.read_bytes() == before
+
+
+@pytest.mark.parametrize("temperature", [float("nan"), float("inf"), True, "1.0"])
+def test_bundle_rejects_invalid_calibration_temperature(tmp_path: Path, temperature) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "temperature")
+    payload = json.loads(policy.read_text())
+    payload["temperature"] = temperature
+    policy.write_text(json.dumps(payload))
+    evidence = json.loads(validation.read_text())
+    evidence["policy_sha256"] = sha256_file(policy)
+    validation.write_text(json.dumps(evidence))
+    with pytest.raises(ValueError, match="temperature"):
+        build_bundle(model, policy, validation, tmp_path / "bundle")
+
+
+@pytest.mark.parametrize("criterion", [float("inf"), -0.1, 1.1, True, "0.02"])
+def test_bundle_rejects_invalid_validation_criterion(tmp_path: Path, criterion) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "criterion")
+    evidence = json.loads(validation.read_text())
+    evidence["acceptance_criteria"]["max_classification_accuracy_drop"] = criterion
+    validation.write_text(json.dumps(evidence))
+    with pytest.raises(ValueError, match="acceptance|criterion|criteria"):
+        build_bundle(model, policy, validation, tmp_path / "bundle")
+
+
+@pytest.mark.parametrize("field", ["sleep_s", "timeout_s", "terminate_grace_s", "heartbeat_timeout_s", "poll_interval_s"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
+def test_watchdog_rejects_invalid_durations_before_spawning(tmp_path: Path, monkeypatch, field, value) -> None:
+    import assurance.watchdog as watchdog
+
+    def unexpected_spawn(*args, **kwargs):
+        pytest.fail("invalid watchdog configuration must be rejected before a child starts")
+
+    monkeypatch.setattr(watchdog.subprocess, "Popen", unexpected_spawn)
+    kwargs = {field: value, "heartbeat_path": tmp_path / "heartbeat"}
+    with pytest.raises(ValueError, match=field):
+        watchdog.run_watchdog(["unused-command"], **kwargs)
+
+
+def test_watchdog_terminates_owned_child_when_monitoring_is_interrupted(monkeypatch) -> None:
+    import assurance.watchdog as watchdog
+
+    real_popen = watchdog.subprocess.Popen
+    children = []
+
+    def tracked_popen(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    real_sleep = watchdog.time.sleep
+    interrupted = False
+
+    def interrupt(duration):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+        real_sleep(duration)
+
+    monkeypatch.setattr(watchdog.subprocess, "Popen", tracked_popen)
+    monkeypatch.setattr(watchdog.time, "sleep", interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            watchdog.run_watchdog(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                restarts=0,
+                terminate_grace_s=0.05,
+            )
+        assert len(children) == 1
+        assert children[0].poll() is not None
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+
+def test_failed_bundle_replacement_preserves_previous_bundle(tmp_path: Path, monkeypatch) -> None:
+    import assurance.model_store as model_store
+
+    bundle = tmp_path / "bundle"
+    manifest = build_bundle(*_write_candidate_artifacts(tmp_path / "a", "a"), bundle)
+    candidate = _write_candidate_artifacts(tmp_path / "b", "b")
+    real_replace = model_store.os.replace
+
+    def fail_publication(source, destination):
+        if ".stage-" in Path(source).name and Path(destination) == bundle:
+            raise OSError("simulated publication failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(model_store.os, "replace", fail_publication)
+    with pytest.raises(OSError, match="publication failure"):
+        build_bundle(*candidate, bundle)
+    assert verify_bundle(bundle) == manifest
+    assert not list(tmp_path.glob(".bundle.*"))
+
+
+def test_watchdog_does_not_restart_unconfirmed_child(monkeypatch) -> None:
+    import assurance.watchdog as watchdog
+
+    class UnconfirmedChild:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    children = []
+
+    def spawn(*args, **kwargs):
+        child = UnconfirmedChild()
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(watchdog.subprocess, "Popen", spawn)
+    monkeypatch.setattr(watchdog, "_terminate_process", lambda *_: ("kill_unconfirmed", None))
+    assert watchdog.run_watchdog(
+        ["unused-command"], restarts=2, sleep_s=0, timeout_s=0.001, poll_interval_s=0.001,
+    ) == 124
+    assert len(children) == 1
+
+
+def _write_rank_bound_policy(policy: Path, validation: Path) -> None:
+    from scipy.stats import beta
+
+    payload = json.loads(policy.read_text())
+    stats = payload["calibration_statistics"]
+    # The threshold rank is fixed before observing tie-dependent captures.
+    stats.update({
+        "samples_total": 30,
+        "event_samples": 20,
+        "event_captures": 20,
+        "target_event_recall_for_threshold_selection": 0.95,
+        "event_recall_bound_method": "order-statistic-one-sided-exact",
+        "event_recall_bound_selection_rank": 19,
+        "event_recall_lower_bound": float(beta.ppf(0.05, 19, 2)),
+    })
+    policy.write_text(json.dumps(payload))
+    evidence = json.loads(validation.read_text())
+    evidence["policy_sha256"] = sha256_file(policy)
+    validation.write_text(json.dumps(evidence))
+
+
+def test_bundle_accepts_verified_selection_rank_bound(tmp_path: Path) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "rank")
+    _write_rank_bound_policy(policy, validation)
+    manifest = build_bundle(model, policy, validation, tmp_path / "bundle")
+    assert verify_bundle(tmp_path / "bundle") == manifest
+
+
+@pytest.mark.parametrize("key,value", [
+    ("event_recall_bound_selection_rank", 20),
+    ("event_recall_bound_selection_rank", True),
+    ("event_captures", 18),
+    ("empirical_event_recall", 0.95),
+    ("event_recall_lower_bound", 0.99),
+])
+def test_bundle_rejects_inconsistent_selection_rank_bound(tmp_path: Path, key, value) -> None:
+    model, policy, validation = _write_candidate_artifacts(tmp_path / "candidate", "rank")
+    _write_rank_bound_policy(policy, validation)
+    payload = json.loads(policy.read_text())
+    payload["calibration_statistics"][key] = value
+    policy.write_text(json.dumps(payload))
+    evidence = json.loads(validation.read_text())
+    evidence["policy_sha256"] = sha256_file(policy)
+    validation.write_text(json.dumps(evidence))
+    with pytest.raises(ValueError, match="calibration policy"):
+        build_bundle(model, policy, validation, tmp_path / "bundle")
+
+
+@pytest.mark.parametrize("destination", [
+    "model", "policy", "model_schema", "data_schema", "tile", "policy_symlink", "policy_hardlink",
+])
+def test_telemetry_rejects_output_overlapping_loaded_inputs(tmp_path: Path, destination) -> None:
+    import os
+
+    import numpy as np
+
+    from assurance.telemetry_log import emit_telemetry
+
+    model, policy, _ = _write_candidate_artifacts(tmp_path / "candidate", "telemetry-output")
+    schema = model_schema_sidecar_path(model)
+    data_root = tmp_path / "data" / "test"
+    (data_root / "event").mkdir(parents=True)
+    tile = data_root / "event" / "0.npy"
+    np.save(tile, np.zeros((3, 8, 8), dtype=np.float32))
+    data_schema = data_root.parent / "input_schema.json"
+    data_schema.write_bytes(schema.read_bytes())
+    protected = {
+        "model": model,
+        "policy": policy,
+        "model_schema": schema,
+        "data_schema": data_schema,
+        "tile": tile,
+    }
+    before = {path: path.read_bytes() for path in protected.values()}
+    if destination == "policy_symlink":
+        output = tmp_path / "linked-policy.json"
+        output.symlink_to(policy)
+    elif destination == "policy_hardlink":
+        output = tmp_path / "linked-policy.json"
+        os.link(policy, output)
+    else:
+        output = protected[destination]
+
+    with pytest.raises(ValueError, match="overlapping"):
+        emit_telemetry(model, data_root, policy, output)
+
+    for path, original in before.items():
+        assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("destination", ["bundle.json", "validation.json", "new-telemetry.jsonl"])
+@pytest.mark.parametrize("model_alias", [False, True])
+def test_telemetry_preserves_entire_loaded_bundle(tmp_path: Path, destination: str, model_alias: bool) -> None:
+    import numpy as np
+
+    from assurance.telemetry_log import emit_telemetry
+
+    bundle = tmp_path / "bundle"
+    manifest = build_bundle(*_write_candidate_artifacts(tmp_path / "candidate", "immutable-output"), bundle)
+    data_root = tmp_path / "data"
+    (data_root / "event").mkdir(parents=True)
+    np.save(data_root / "event" / "0.npy", np.zeros((3, 8, 8), dtype=np.float32))
+    (data_root / "input_schema.json").write_bytes((bundle / "input_schema.json").read_bytes())
+    before = {path.name: path.read_bytes() for path in bundle.iterdir()}
+    model = bundle / "model.onnx"
+    if model_alias:
+        alias_dir = tmp_path / "alias"
+        alias_dir.mkdir()
+        model = alias_dir / "model.onnx"
+        model.symlink_to(bundle / "model.onnx")
+        (alias_dir / "input_schema.json").symlink_to(bundle / "input_schema.json")
+
+    with pytest.raises(ValueError, match="overlapping"):
+        emit_telemetry(model, data_root, bundle / "policy.json", bundle / destination)
+
+    assert {path.name: path.read_bytes() for path in bundle.iterdir()} == before
+    assert verify_bundle(bundle) == manifest

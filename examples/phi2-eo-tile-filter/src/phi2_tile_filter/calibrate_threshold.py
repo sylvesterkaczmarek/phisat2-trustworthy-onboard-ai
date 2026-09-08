@@ -6,25 +6,41 @@ import math
 from pathlib import Path
 
 import numpy as np
+from scipy.special import logsumexp
 from scipy.stats import beta
 from sklearn.metrics import precision_score, recall_score, roc_auc_score
 
-from .policy import DecisionPolicy, softmax
+from .policy import DecisionPolicy, _scaled_logits, softmax
 from .quality_guard import calibrate_input_quality_guard
 from .runtime import OnnxRunner
 from .utils import discover_labeled_tiles, load_tile_numpy
 
 
 def _nll(logits: np.ndarray, labels: np.ndarray, temperature: float) -> float:
-    probs = softmax(logits, temperature=temperature)
-    selected = probs[np.arange(labels.size), labels]
-    return float(-np.mean(np.log(np.clip(selected, 1e-12, 1.0))))
+    scaled = _scaled_logits(logits, temperature=temperature)
+    losses = logsumexp(scaled, axis=1) - scaled[np.arange(labels.size), labels]
+    # Log space preserves the penalty for confidently wrong predictions even
+    # when their probabilities underflow to zero. Divide before summing to
+    # avoid overflow in the mean of large, finite losses.
+    return float(np.sum(losses / labels.size))
 
 
 def fit_temperature(logits: np.ndarray, labels: np.ndarray) -> float:
     """Deterministic one-dimensional grid search for temperature scaling."""
+    logits = np.asarray(logits, dtype=np.float64)
+    labels = np.asarray(labels)
+    if logits.ndim != 2 or logits.shape[1] != 2 or logits.shape[0] == 0:
+        raise ValueError("temperature fitting requires non-empty logits with shape (N, 2)")
+    if (
+        labels.shape != (logits.shape[0],)
+        or not np.issubdtype(labels.dtype, np.integer)
+        or not np.all((labels == 0) | (labels == 1))
+    ):
+        raise ValueError("temperature fitting requires one integer class label (0 or 1) per row")
     grid = np.geomspace(0.25, 4.0, 121)
     losses = np.array([_nll(logits, labels, float(t)) for t in grid])
+    if not np.any(np.isfinite(losses)):
+        raise ValueError("temperature fitting losses exceed the finite numerical range")
     return float(grid[int(np.argmin(losses))])
 
 
@@ -35,6 +51,10 @@ def clopper_pearson_lower_bound(
     confidence_level: float = 0.95,
 ) -> float:
     """One-sided exact Clopper-Pearson lower confidence bound for a binomial proportion."""
+    if isinstance(trials, (bool, np.bool_)) or not isinstance(trials, (int, np.integer)):
+        raise ValueError("trials must be an integer")
+    if isinstance(successes, (bool, np.bool_)) or not isinstance(successes, (int, np.integer)):
+        raise ValueError("successes must be an integer")
     if trials <= 0:
         raise ValueError("trials must be positive")
     if successes < 0 or successes > trials:
@@ -47,11 +67,15 @@ def clopper_pearson_lower_bound(
     return float(beta.ppf(alpha, successes, trials - successes + 1))
 
 
+def _event_selection_rank(event_count: int, target_recall: float) -> int:
+    return max(1, int(math.ceil(target_recall * event_count)))
+
+
 def _event_threshold(scores: np.ndarray, labels: np.ndarray, target_recall: float) -> float:
     positive_scores = np.sort(scores[labels == 1])[::-1]
     if positive_scores.size == 0:
         raise ValueError("calibration set contains no event examples")
-    required = max(1, int(math.ceil(target_recall * positive_scores.size)))
+    required = _event_selection_rank(positive_scores.size, target_recall)
     return float(positive_scores[required - 1])
 
 
@@ -79,7 +103,7 @@ def calibrate(
         raise ValueError("min_event_recall_lower_bound must be in [0, 1]")
     if not 0.0 < quality_guard_quantile <= 1.0:
         raise ValueError("quality_guard_quantile must be in (0, 1]")
-    if quality_guard_margin < 1.0:
+    if not np.isfinite(quality_guard_margin) or quality_guard_margin < 1.0:
         raise ValueError("quality_guard_margin must be >= 1")
 
     runner = OnnxRunner(model_path)
@@ -111,8 +135,14 @@ def calibrate(
     background_count = int(np.sum(y == 0))
     event_captures = int(np.sum((y == 1) & (predicted_event == 1)))
     empirical_recall = float(recall_score(y, predicted_event, pos_label=1, zero_division=0))
+    selection_rank = _event_selection_rank(event_count, target_recall)
+    # The threshold is selected on these observations. Its population recall
+    # has an order-statistic lower bound using the preselected rank, with the
+    # same beta quantile as the binomial formula. Tied scores may increase the
+    # observed captures, but must not increase the rank used for this bound.
+    # For continuous i.i.d. scores this is exact; retaining ties is conservative.
     recall_lower_bound = clopper_pearson_lower_bound(
-        event_captures,
+        selection_rank,
         event_count,
         confidence_level=confidence_level,
     )
@@ -159,7 +189,8 @@ def calibrate(
             "roc_auc": auc,
             "event_recall_lower_bound": recall_lower_bound,
             "event_recall_confidence_level": float(confidence_level),
-            "event_recall_bound_method": "clopper-pearson-one-sided-exact",
+            "event_recall_bound_method": "order-statistic-one-sided-exact",
+            "event_recall_bound_selection_rank": selection_rank,
         },
         "calibration_acceptance": {
             "required_min_event_recall_lower_bound": (

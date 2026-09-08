@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support, roc_auc_score
 
+from .filesystem import assert_file_outputs_disjoint, staged_text_file
+from .input_schema import find_dataset_input_schema, find_model_input_schema
 from .policy import softmax
 from .runtime import OnnxRunner
 from .utils import discover_labeled_tiles, load_tile_numpy
@@ -68,11 +70,27 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
+    if args.out is not None:
+        bundle_roots = [
+            parent
+            for parent in {Path(args.onnx).parent.resolve(), Path(args.onnx).resolve().parent}
+            if (parent / "bundle.json").is_file()
+        ]
+        assert_file_outputs_disjoint(
+            [args.out],
+            protected_paths=[
+                args.onnx,
+                args.data,
+                find_model_input_schema(args.onnx),
+                find_dataset_input_schema(args.data),
+                *bundle_roots,
+            ],
+        )
     result = evaluate(args.onnx, args.data, temperature=args.temperature)
     text = json.dumps(result, indent=2, sort_keys=True)
     if args.out is not None:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(text + "\n", encoding="utf-8")
+        with staged_text_file(args.out) as handle:
+            handle.write(text + "\n")
     print(text)
 
 

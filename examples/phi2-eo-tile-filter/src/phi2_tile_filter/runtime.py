@@ -11,6 +11,7 @@ import onnxruntime as ort
 from .input_schema import (
     assert_dataset_schema_compatible,
     band_ids,
+    find_model_input_schema,
     validate_model_input_schema_binding,
 )
 from .policy import DecisionPolicy, softmax
@@ -42,12 +43,13 @@ def input_spec_from_session(session: ort.InferenceSession) -> ModelInputSpec:
     return ModelInputSpec(inputs[0].name, bands, height)
 
 
-def _stat_fingerprint(stat_result: Any) -> tuple[int, int, int, int]:
+def _stat_fingerprint(stat_result: Any) -> tuple[int, int, int, int, int]:
     return (
         int(getattr(stat_result, "st_dev", 0)),
         int(getattr(stat_result, "st_ino", 0)),
         int(stat_result.st_size),
         int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
     )
 
 
@@ -59,11 +61,21 @@ class OnnxRunner:
         intra_op_threads: int | None = None,
         input_schema_path: str | Path | None = None,
     ):
-        self.model_path = Path(model_path)
+        requested_model_path = Path(model_path)
+        self.model_path = requested_model_path.resolve(strict=True)
         if not self.model_path.is_file():
             raise FileNotFoundError(self.model_path)
+        model_fingerprint = _stat_fingerprint(self.model_path.stat())
+        self.model_sha256 = sha256_file(self.model_path)
+        # Preserve sidecar discovery beside the requested model name, then bind
+        # every read to the selected targets even if an alias is retargeted.
+        schema_path = find_model_input_schema(
+            requested_model_path, input_schema_path
+        ).resolve(strict=True)
+        schema_fingerprint = _stat_fingerprint(schema_path.stat())
+        self.input_schema_file_sha256 = sha256_file(schema_path)
         self.input_schema, self.input_schema_sha256, self.input_schema_path = (
-            validate_model_input_schema_binding(self.model_path, input_schema_path)
+            validate_model_input_schema_binding(self.model_path, schema_path)
         )
         options = ort.SessionOptions()
         if intra_op_threads is not None:
@@ -75,11 +87,13 @@ class OnnxRunner:
             sess_options=options,
             providers=["CPUExecutionProvider"],
         )
+        if _stat_fingerprint(self.model_path.stat()) != model_fingerprint:
+            raise ValueError("model file changed while the runtime was loading it")
+        if _stat_fingerprint(schema_path.stat()) != schema_fingerprint:
+            raise ValueError("input schema file changed while the runtime was loading it")
         self.execution_providers = tuple(self.session.get_providers())
         self.selected_execution_provider = self.execution_providers[0]
         self.spec = input_spec_from_session(self.session)
-        self.model_sha256 = sha256_file(self.model_path)
-        self.input_schema_file_sha256 = sha256_file(self.input_schema_path)
         self.preprocessing_sha256 = str(self.input_schema["preprocessing_sha256"])
         tensor = self.input_schema["tensor"]
         schema_bands = len(tensor["bands"])

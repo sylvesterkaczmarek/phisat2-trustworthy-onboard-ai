@@ -12,7 +12,8 @@ if str(EXAMPLE_SRC) not in sys.path:
     sys.path.insert(0, str(EXAMPLE_SRC))
 
 from phi2_tile_filter.bandwidth_filter import load_policy_artifact  # noqa: E402
-from phi2_tile_filter.filesystem import assert_paths_disjoint, staged_text_file  # noqa: E402
+from phi2_tile_filter.filesystem import assert_file_outputs_disjoint, staged_text_file  # noqa: E402
+from phi2_tile_filter.input_schema import find_dataset_input_schema  # noqa: E402
 from phi2_tile_filter.runtime import OnnxRunner  # noqa: E402
 from phi2_tile_filter.telemetry import (  # noqa: E402
     FINAL_TEST_RECORD_KIND,
@@ -39,8 +40,20 @@ def emit_telemetry(
     if not items:
         raise ValueError(f"no labeled tiles found under {data_root}")
 
-    output = Path(output).resolve(strict=False)
-    assert_paths_disjoint(output, data_root, description="telemetry output/input paths")
+    protected_paths = [
+        data_root,
+        model_path,
+        policy_path,
+        runner.input_schema_path,
+        find_dataset_input_schema(data_root),
+    ]
+    for bundle_dir in {
+        Path(model_path).resolve(strict=False).parent,
+        Path(model_path).parent.resolve(strict=False),
+    }:
+        if (bundle_dir / "bundle.json").exists():
+            protected_paths.append(bundle_dir)
+    (output,) = assert_file_outputs_disjoint([output], protected_paths=protected_paths)
     identity = resolve_artifact_identity(
         model_path,
         policy_path,

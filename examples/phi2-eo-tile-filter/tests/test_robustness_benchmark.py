@@ -240,6 +240,7 @@ def _summary_fixture(tmp_path: Path) -> tuple[Path, Path, list[dict], list[dict]
                 schema_hash=schema_hash,
             )
         )
+        records[-1]["preprocessing_sha256"] = schema["preprocessing_sha256"]
     log = tmp_path / "benchmark.jsonl"
     log.write_text("".join(json.dumps(record) + "\n" for record in records))
     return manifest_path, log, samples, records
@@ -271,4 +272,74 @@ def test_robustness_summary_rejects_manifest_schema_mismatch(tmp_path: Path) -> 
     manifest["input_schema_sha256"] = "0" * 64
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="manifest input schema hash"):
+        summarize_benchmark(manifest_path, log)
+
+
+@pytest.mark.parametrize("parameter", ["noise_std", "brightness_shift", "band_gain_drift", "band_offset_drift"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_nonfinite_perturbations_do_not_create_a_misleading_benchmark(
+    tmp_path: Path, parameter: str, value: float,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    write_input_schema(schema_path, build_input_schema(bands=1, height=8))
+    output = tmp_path / "benchmark"
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        generate_benchmark(output, schema_path, **{parameter: value})
+    assert not output.exists()
+
+
+def test_benchmark_rejects_contract_that_would_make_nominal_samples_invalid(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    write_input_schema(schema_path, build_input_schema(bands=1, height=8, value_range=(0.2, 0.8)))
+    with pytest.raises(ValueError, match="source range"):
+        generate_benchmark(tmp_path / "benchmark", schema_path)
+
+
+@pytest.mark.parametrize("true_class", [2, True, None, "1"])
+def test_summary_rejects_invalid_label_instead_of_omitting_it_from_recall(
+    tmp_path: Path, true_class: object,
+) -> None:
+    manifest_path, log, _, _ = _summary_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["samples"][1]["true_class"] = true_class
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="true_class 0 or 1"):
+        summarize_benchmark(manifest_path, log)
+
+
+@pytest.mark.parametrize("fault", ["class_name", "category", "external", "symlink"])
+def test_summary_rejects_inconsistent_or_external_manifest_samples(tmp_path: Path, fault: str) -> None:
+    manifest_path, log, _, _ = _summary_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    sample = manifest["samples"][0]
+    if fault == "class_name":
+        sample["true_class_name"] = "event"
+    elif fault == "category":
+        sample["category"] = "corrupted"
+    elif fault == "external":
+        sample["file"] = "../outside.npy"
+    else:
+        source = tmp_path / sample["file"]
+        external = tmp_path.parent / (tmp_path.name + "-outside.npy")
+        external.write_bytes(source.read_bytes())
+        source.unlink()
+        source.symlink_to(external)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="class_name|file path|within the benchmark"):
+        summarize_benchmark(manifest_path, log)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("preprocessing_sha256", "0" * 64),
+    ("preprocessing_version", 99),
+    ("input_band_ids", ["wrong_band"]),
+])
+def test_summary_checks_preprocessing_identity_against_actual_schema(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    manifest_path, log, _, records = _summary_fixture(tmp_path)
+    for record in records:
+        record[field] = value
+    log.write_text("".join(json.dumps(record) + "\n" for record in records))
+    with pytest.raises(ValueError, match="does not match input schema"):
         summarize_benchmark(manifest_path, log)

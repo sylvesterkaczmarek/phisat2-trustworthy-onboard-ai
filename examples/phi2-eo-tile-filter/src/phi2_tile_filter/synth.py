@@ -126,7 +126,7 @@ def write_dataset(
             "size": int(size),
             "class_names": list(CLASSES),
             "split_counts": counts,
-            "split_roles": SPLIT_ROLES,
+            "split_roles": dict(SPLIT_ROLES),
             "split_seed_spawn_keys": split_seed_spawn_keys,
             "split_fractions_requested": {
                 "train": float(train_fraction),

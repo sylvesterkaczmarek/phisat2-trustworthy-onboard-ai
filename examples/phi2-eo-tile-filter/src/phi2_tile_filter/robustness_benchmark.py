@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
@@ -222,19 +223,15 @@ def generate_benchmark(
     spatial_shift_px: int = 3,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    if samples_per_category < 4:
+    if type(samples_per_category) is not int or samples_per_category < 4:
         raise ValueError("samples_per_category must be at least 4")
-    if (
-        noise_std < 0.0
-        or brightness_shift < 0.0
-        or band_gain_drift < 0.0
-        or band_offset_drift < 0.0
-    ):
-        raise ValueError("perturbation magnitudes must be non-negative")
+    magnitudes = (noise_std, brightness_shift, band_gain_drift, band_offset_drift)
+    if any(not math.isfinite(value) or value < 0.0 for value in magnitudes):
+        raise ValueError("perturbation magnitudes must be finite and non-negative")
     if not 0.0 <= cloud_opacity <= 1.0:
         raise ValueError("cloud_opacity must be in [0, 1]")
-    if spatial_shift_px < 0:
-        raise ValueError("spatial_shift_px must be non-negative")
+    if type(spatial_shift_px) is not int or spatial_shift_px < 0:
+        raise ValueError("spatial_shift_px must be a non-negative integer")
 
     schema = read_input_schema(input_schema_path)
     tensor = schema["tensor"]
@@ -245,6 +242,12 @@ def generate_benchmark(
         or source["dtype"] != "float32"
     ):
         raise ValueError("robustness benchmark currently requires float32 HWC NumPy input")
+    if source["value_range"] != [0.0, 1.0] or schema["normalization"] != {
+        "name": "identity_unit_interval",
+        "version": 1,
+        "parameters": {},
+    }:
+        raise ValueError("robustness benchmark requires identity-normalized source range [0, 1]")
     size = int(tensor["height"])
     if int(tensor["width"]) != size:
         raise ValueError("robustness benchmark currently requires square tiles")
@@ -522,12 +525,42 @@ def summarize_benchmark(
     if not isinstance(samples, list) or not samples:
         raise ValueError("robustness benchmark manifest has no samples")
 
-    manifest_names = [str(sample.get("file")) for sample in samples]
+    benchmark_root = manifest_path.parent.resolve()
+    manifest_names: list[str] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("robustness benchmark samples must be JSON objects")
+        category = sample.get("category")
+        if category not in CATEGORIES:
+            raise ValueError(f"unsupported benchmark category: {category}")
+        true_class = sample.get("true_class")
+        if category == "ood":
+            if true_class is not None:
+                raise ValueError("OOD benchmark samples must have an unknown true_class")
+            class_name = "unknown"
+        else:
+            if type(true_class) is not int or true_class not in (0, 1):
+                raise ValueError("labelled benchmark samples require true_class 0 or 1")
+            class_name = ("background", "event")[true_class]
+        if sample.get("true_class_name") != class_name:
+            raise ValueError("benchmark true_class_name does not match true_class")
+        name = sample.get("file")
+        if not isinstance(name, str) or not name:
+            raise ValueError("benchmark file must be a non-empty relative path")
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts or "\\" in name:
+            raise ValueError("benchmark file must stay within the benchmark directory")
+        if len(relative.parts) < 3 or relative.parts[:2] != (category, class_name):
+            raise ValueError("benchmark file path does not match its category and class")
+        if not (benchmark_root / relative).resolve().is_relative_to(benchmark_root):
+            raise ValueError("benchmark file must stay within the benchmark directory")
+        manifest_names.append(name)
     if len(manifest_names) != len(set(manifest_names)):
         raise ValueError("robustness benchmark manifest contains duplicate file entries")
 
     schema_path = manifest_path.parent / "input_schema.json"
-    schema_hash = input_schema_sha256(read_input_schema(schema_path))
+    schema = read_input_schema(schema_path)
+    schema_hash = input_schema_sha256(schema)
     if manifest.get("input_schema_sha256") != schema_hash:
         raise ValueError("robustness benchmark manifest input schema hash is inconsistent")
 
@@ -555,6 +588,14 @@ def summarize_benchmark(
     quality_guard_enabled = _one_value(telemetry_records, "input_quality_guard_enabled")
     if identity["input_schema_sha256"] != schema_hash:
         raise ValueError("benchmark telemetry input schema does not match benchmark manifest")
+    if identity["preprocessing_sha256"] != schema["preprocessing_sha256"]:
+        raise ValueError("benchmark telemetry preprocessing hash does not match input schema")
+    expected_bands = [band["id"] for band in schema["tensor"]["bands"]]
+    for record in telemetry_records:
+        if record.get("input_band_ids") != expected_bands:
+            raise ValueError("benchmark telemetry band ordering does not match input schema")
+        if record.get("preprocessing_version") != schema["preprocessing"]["version"]:
+            raise ValueError("benchmark telemetry preprocessing version does not match input schema")
     if identity["deployment_bundle_id"] is not None and bundle_verified is not True:
         raise ValueError("benchmark telemetry names a deployment bundle that was not verified")
 
