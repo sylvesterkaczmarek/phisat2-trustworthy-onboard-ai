@@ -76,8 +76,8 @@ def _reject_tiff(path: Path) -> None:
 
 
 def _legacy_normalize_npy(array: np.ndarray) -> np.ndarray:
-    if not np.issubdtype(array.dtype, np.number):
-        raise ValueError("NumPy tiles must contain numeric data")
+    if array.dtype.kind not in "iuf":
+        raise ValueError("NumPy tiles must contain real integer or floating-point data")
     if np.issubdtype(array.dtype, np.integer):
         info = np.iinfo(array.dtype)
         array = array.astype(np.float32) / float(info.max)
@@ -112,6 +112,10 @@ def _apply_schema_normalization(array: np.ndarray, schema: dict) -> np.ndarray:
     source = schema["source"]
     normalization = schema["normalization"]
     expected_dtype = np.dtype(source["dtype"])
+    if expected_dtype.kind not in "iuf":
+        raise ValueError("input schema source dtype must be a real integer or floating-point type")
+    if normalization.get("parameters"):
+        raise ValueError("this normalization implementation does not support parameters")
     if array.dtype != expected_dtype:
         raise ValueError(
             f"input dtype {array.dtype} does not match schema source dtype {expected_dtype}"
@@ -277,12 +281,13 @@ def load_tile_numpy(
         height = width = int(size)
         if path.suffix.lower() == ".npy":
             normalized = _legacy_normalize_npy(np.load(path, allow_pickle=False))
+            chw = _legacy_layout(normalized, bands=expected_bands, path=path)
         else:
             raw = _load_exact_image(path, expected_channels=expected_bands)
             if raw.dtype != np.uint8:
                 raise ValueError("PNG/JPEG legacy loader accepts only uint8 L/RGB/RGBA data")
             normalized = raw.astype(np.float32) / 255.0
-        chw = _legacy_layout(normalized, bands=expected_bands, path=path)
+            chw = normalized[None, :, :] if normalized.ndim == 2 else normalized.transpose(2, 0, 1)
 
     tensor = torch.from_numpy(np.ascontiguousarray(chw)).unsqueeze(0)
     if tensor.shape[-2:] != (height, width):
@@ -361,14 +366,23 @@ def read_dataset_manifest(root: str | Path) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"dataset manifest not found: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("dataset manifest must be a JSON object")
     if payload.get("schema_version") not in (1, 2, 3):
         raise ValueError("unsupported dataset manifest schema")
     if payload.get("schema_version") in (2, 3):
-        expected_roles = {"train", "calib", "validation", "test"}
-        if set(payload.get("split_counts", {})) != expected_roles:
+        from .synth import SPLIT_ROLES
+
+        expected_roles = set(SPLIT_ROLES)
+        counts = payload.get("split_counts")
+        if not isinstance(counts, dict) or set(counts) != expected_roles:
             raise ValueError("four-way dataset manifest is missing a required split")
-        if set(payload.get("split_roles", {})) != expected_roles:
-            raise ValueError("four-way dataset manifest is missing split-role metadata")
+        if any(type(count) is not int or count <= 0 for count in counts.values()):
+            raise ValueError("dataset split counts must be positive integers")
+        if type(payload.get("samples")) is not int or payload["samples"] != sum(counts.values()):
+            raise ValueError("dataset sample count must equal the sum of split counts")
+        if payload.get("split_roles") != SPLIT_ROLES:
+            raise ValueError("four-way dataset manifest has invalid split-role metadata")
     if payload.get("schema_version") == 3:
         schema_path = root / "input_schema.json"
         schema = read_input_schema(schema_path)

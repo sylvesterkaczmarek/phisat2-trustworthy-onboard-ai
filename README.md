@@ -44,7 +44,7 @@ Implemented assurance mechanisms include:
 - SHA-256 binding of the input contract through dataset, checkpoint, ONNX, calibration, validation, telemetry, and deployment bundle;
 - FP32 ONNX export with numerical verification and static QDQ INT8 quantization;
 - validation-only quantization gates for classification, event retention, decision agreement, and score drift;
-- empirical event recall plus a one-sided exact Clopper-Pearson lower confidence bound;
+- empirical event recall plus a one-sided recall bound based on the threshold's preselected order-statistic rank;
 - a calibrated lightweight input-quality/OOD guard;
 - conservative retention on event detection, low confidence, input-quality trigger, input/preprocessing failure, or inference failure;
 - deployment-bound telemetry carrying bundle, model, policy, schema, preprocessing, and per-input hashes;
@@ -119,7 +119,11 @@ The final test set is not used to accept a model.
 - `validation`: FP32 versus INT8 and calibrated-policy acceptance gates.
 - `test`: final reporting after the bundle has already passed acceptance and promotion.
 
-The requested recall is a threshold-selection target. The calibration artifact separately reports achieved empirical recall and its one-sided exact Clopper-Pearson lower confidence bound.
+The requested recall is a threshold-selection target. The calibration artifact separately reports achieved empirical recall and a one-sided order-statistic lower bound. Tied scores can increase observed captures without increasing the rank used for this bound. See [calibration uncertainty](docs/assurance.md#calibration-uncertainty) for assumptions and legacy-report handling.
+
+Temperature fitting evaluates cross-entropy in log space so confidently wrong
+predictions retain their full penalty. Non-finite probabilities, model outputs
+and acceptance tolerances are rejected before they can support an accepted model.
 
 ## Robustness benchmark
 
@@ -189,6 +193,15 @@ A deployable bundle contains the exact:
 Validation evidence records the SHA-256 of the exact calibration-policy artifact used for validation. Bundle construction rejects evidence generated under a different threshold/confidence/quality-guard policy, even when the model and input schema are otherwise identical.
 
 Promotion verifies the new bundle and the currently active stored bundle before atomically changing the active pointer, so a corrupted active bundle is not silently preserved as the claimed rollback target. Runtime only reports `deployment_bundle_verified: true` after validating the complete local bundle manifest and all component hashes, including validation evidence.
+
+Rollback can recover a fully verified previous deployment even when the active
+bundle is damaged. It then clears the unusable rollback pointer and preserves
+the damaged files for diagnosis.
+
+Model exports, checkpoints and their reports are staged before replacement.
+Downlink files and their log are restored together if publication fails, and
+partial copied tiles are removed. Output paths cannot overwrite source models,
+policies, schemas or input data.
 
 Runtime telemetry identifies the deployment bundle, model, policy, semantic input contract, exact schema file, preprocessing fingerprint, and observed input file. The final summarizer refuses to combine inconsistent final-test/downlink records.
 

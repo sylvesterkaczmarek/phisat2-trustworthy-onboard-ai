@@ -11,9 +11,10 @@ from .filesystem import (
     assert_paths_disjoint,
     assert_safe_tree_target,
     remove_stage,
-    replace_tree_from_stage,
+    replace_outputs_from_stages,
     sibling_stage_path,
 )
+from .input_schema import find_dataset_input_schema
 from .policy import DecisionPolicy
 from .quality_guard import InputQualityGuard
 from .runtime import OnnxRunner
@@ -96,14 +97,27 @@ def filter_tiles(
     if not files:
         raise ValueError(f"no supported tiles found under {data_root}")
 
+    protected_paths = [
+        data_root,
+        Path(model_path),
+        Path(policy_path),
+        runner.input_schema_path,
+        find_dataset_input_schema(data_root),
+    ]
+    for model_parent in {Path(model_path).parent.resolve(), runner.model_path.parent}:
+        if (model_parent / "bundle.json").is_file():
+            protected_paths.append(model_parent)
     downlink_root = assert_safe_tree_target(
         downlink_root,
-        protected_paths=[data_root],
+        protected_paths=protected_paths,
         operation="downlink tree replacement",
     )
     log_path = Path(log_path).resolve(strict=False)
-    assert_paths_disjoint(log_path, data_root, description="downlink log/input paths")
+    for protected in protected_paths:
+        assert_paths_disjoint(log_path, protected, description="downlink log/input paths")
     assert_paths_disjoint(log_path, downlink_root, description="downlink log/output paths")
+    if log_path.exists() and not log_path.is_file():
+        raise ValueError(f"downlink log must be a file: {log_path}")
 
     identity = resolve_artifact_identity(
         model_path,
@@ -116,6 +130,11 @@ def filter_tiles(
     )
     if identity["policy_sha256"] != policy_sha:
         raise ValueError("resolved policy identity changed while loading policy")
+    if identity["deployment_bundle_verified"]:
+        for output in (downlink_root, log_path):
+            assert_paths_disjoint(
+                output, Path(model_path).parent, description="downlink output/deployment bundle paths"
+            )
 
     stage_root = sibling_stage_path(downlink_root, label="stage")
     log_stage = sibling_stage_path(log_path, label="tmp")
@@ -182,6 +201,9 @@ def filter_tiles(
                         if isinstance(size_bytes, int):
                             retained_bytes += size_bytes
                     except Exception as exc:
+                        # A failed copy may already have created a partial file.
+                        # If removing it fails, abort instead of publishing it.
+                        destination.unlink(missing_ok=True)
                         copy_failure_count += 1
                         record["downlink_error"] = f"{type(exc).__name__}: {exc}"
                         record["downlink_materialized"] = False
@@ -194,13 +216,9 @@ def filter_tiles(
                 )
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
             handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except OSError:
-                pass
+            os.fsync(handle.fileno())
 
-        replace_tree_from_stage(stage_root, downlink_root)
-        os.replace(log_stage, log_path)
+        replace_outputs_from_stages([(stage_root, downlink_root), (log_stage, log_path)])
     finally:
         remove_stage(stage_root)
         remove_stage(log_stage)

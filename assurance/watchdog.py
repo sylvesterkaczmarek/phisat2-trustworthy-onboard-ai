@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -70,10 +71,27 @@ def run_watchdog(
     poll_interval_s: float = 0.05,
 ) -> int:
     """Run a command with bounded restart, timeout, and optional heartbeat checks."""
-    if not command:
-        raise ValueError("command must not be empty")
-    if restarts < 0:
-        raise ValueError("restarts must be non-negative")
+    if not command or isinstance(command, (str, bytes)):
+        raise ValueError("command must be a non-empty sequence of arguments")
+    if isinstance(restarts, bool) or not isinstance(restarts, int) or restarts < 0:
+        raise ValueError("restarts must be a non-negative integer")
+    for name, value in (
+        ("sleep_s", sleep_s),
+        ("timeout_s", timeout_s),
+        ("terminate_grace_s", terminate_grace_s),
+        ("heartbeat_timeout_s", heartbeat_timeout_s),
+        ("poll_interval_s", poll_interval_s),
+    ):
+        if value is None and name in {"timeout_s", "heartbeat_timeout_s"}:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a finite number")
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError(f"{name} must be a finite number")
     if sleep_s < 0:
         raise ValueError("sleep_s must be non-negative")
     if timeout_s is not None and timeout_s <= 0:
@@ -96,6 +114,7 @@ def run_watchdog(
 
     attempts = restarts + 1
     last_watchdog_code = 1
+    process: subprocess.Popen | None = None
     try:
         for attempt in range(1, attempts + 1):
             started_monotonic = time.monotonic()
@@ -163,7 +182,11 @@ def run_watchdog(
 
             ended_unix_s = time.time()
             duration_s = time.monotonic() - started_monotonic
-            restart_scheduled = outcome != "success" and attempt < attempts
+            restart_scheduled = (
+                outcome != "success"
+                and termination_action != "kill_unconfirmed"
+                and attempt < attempts
+            )
             record = {
                 "schema_version": WATCHDOG_TELEMETRY_SCHEMA_VERSION,
                 "record_kind": "watchdog_attempt",
@@ -191,12 +214,19 @@ def run_watchdog(
             last_watchdog_code = watchdog_code
             if outcome == "success":
                 return 0
+            if not restart_scheduled:
+                return int(last_watchdog_code or 1)
             if restart_scheduled and sleep_s:
                 time.sleep(sleep_s)
         return int(last_watchdog_code or 1)
     finally:
-        if log_handle is not None:
-            log_handle.close()
+        try:
+            # A monitoring error or interruption must not leave our child running.
+            if process is not None:
+                _terminate_process(process, terminate_grace_s)
+        finally:
+            if log_handle is not None:
+                log_handle.close()
 
 
 def main() -> int:

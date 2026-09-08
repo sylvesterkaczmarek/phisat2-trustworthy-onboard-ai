@@ -36,7 +36,13 @@ class DecisionPolicy:
             return True, "inference_failure_fallback"
         if input_quality_ok is False:
             return True, "input_quality_fallback"
-        if not np.isfinite(prob_event) or not np.isfinite(max_prob):
+        if (
+            not np.isfinite(prob_event)
+            or not np.isfinite(max_prob)
+            or not 0.0 <= prob_event <= 1.0
+            or not 0.5 <= max_prob <= 1.0
+            or not np.isclose(max_prob, max(prob_event, 1.0 - prob_event), rtol=1e-6, atol=1e-8)
+        ):
             return True, "invalid_probability_fallback"
         if prob_event >= self.event_threshold:
             return True, "event"
@@ -45,7 +51,8 @@ class DecisionPolicy:
         return False, "confident_background"
 
 
-def softmax(logits: np.ndarray, *, temperature: float = 1.0) -> np.ndarray:
+def _scaled_logits(logits: np.ndarray, *, temperature: float) -> np.ndarray:
+    """Return temperature-scaled logits shifted to a non-positive range."""
     logits = np.asarray(logits, dtype=np.float64)
     if logits.ndim != 2 or logits.shape[1] != 2:
         raise ValueError("expected logits with shape (N, 2)")
@@ -53,7 +60,20 @@ def softmax(logits: np.ndarray, *, temperature: float = 1.0) -> np.ndarray:
         raise ValueError("logits contain non-finite values")
     if not np.isfinite(temperature) or temperature <= 0.0:
         raise ValueError("temperature must be finite and positive")
-    scaled = logits / temperature
-    scaled -= np.max(scaled, axis=1, keepdims=True)
-    exp = np.exp(scaled)
+    # Scale down before subtraction, but shift before scaling up. This handles
+    # both tiny temperatures and opposite-sign logits near the float64 limit.
+    # Negative overflow represents a negligible exponential, never a NaN.
+    with np.errstate(over="ignore", under="ignore"):
+        if temperature >= 1.0:
+            scaled = logits / temperature
+            scaled -= np.max(scaled, axis=1, keepdims=True)
+        else:
+            scaled = (logits - np.max(logits, axis=1, keepdims=True)) / temperature
+    return scaled
+
+
+def softmax(logits: np.ndarray, *, temperature: float = 1.0) -> np.ndarray:
+    scaled = _scaled_logits(logits, temperature=temperature)
+    with np.errstate(under="ignore"):
+        exp = np.exp(scaled)
     return exp / exp.sum(axis=1, keepdims=True)

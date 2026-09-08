@@ -95,8 +95,8 @@ def validate_models(
         "max_event_retention_recall_drop": max_event_retention_recall_drop,
         "max_event_score_drift": max_event_score_drift,
     }
-    if any(value < 0.0 for value in nonnegative.values()):
-        raise ValueError("validation drop/drift tolerances must be non-negative")
+    if any(not np.isfinite(value) or value < 0.0 for value in nonnegative.values()):
+        raise ValueError("validation drop/drift tolerances must be finite and non-negative")
     for name, value in {
         "min_argmax_agreement": min_argmax_agreement,
         "min_policy_decision_agreement": min_policy_decision_agreement,

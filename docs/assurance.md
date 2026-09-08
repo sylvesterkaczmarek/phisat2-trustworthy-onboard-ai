@@ -88,7 +88,30 @@ Telemetry schema version 6 is emitted by the current runtime. The validator reta
 
 The requested event recall is used to select a threshold on the calibration sample. It is not treated as a population-level guarantee.
 
-The calibration artifact records positive/background sample counts, requested threshold-selection recall, achieved empirical recall, precision, ROC-AUC, and a one-sided exact Clopper-Pearson lower confidence bound. An optional minimum lower-bound requirement can reject a calibration before bundle construction.
+The calibration artifact records positive/background sample counts, requested
+threshold-selection recall, achieved empirical recall, precision, ROC-AUC, and
+a one-sided order-statistic recall bound. For `n` calibration events and target
+recall `r`, the threshold uses the `k = ceil(r * n)`th largest event score. The
+lower bound is the `1 - confidence_level` quantile of `Beta(k, n - k + 1)`.
+Its method identifier is `order-statistic-one-sided-exact`.
+
+This uses the rank chosen before observing scores. Ties retained by the `>=`
+decision can increase observed captures without increasing that rank or its
+bound. Using the realised capture count would overstate coverage for some
+discrete score distributions. The order-statistic argument assumes i.i.d.
+calibration events independent of the trained model and is exact for continuous
+scores, with conservative coverage under ties. Positive temperature scaling
+preserves the binary score order. See [SciPy's order-statistic distribution](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.order_statistic.html).
+
+An optional minimum lower-bound requirement can reject calibration before bundle
+construction. Legacy `clopper-pearson-one-sided-exact` policies remain readable
+for archived runs; recalibrate before relying on a legacy tied-score bound for
+new acceptance decisions.
+
+Temperature fitting minimises cross-entropy in log space, following the
+[temperature-scaling objective](https://proceedings.mlr.press/v70/guo17a.html).
+Clipping tiny probabilities before taking logs can under-penalise confidently
+wrong predictions and is not used for selecting temperature.
 
 The input-quality guard is also calibrated on this split. Its quantile/margin threshold should be interpreted as a deterministic demonstrator setting, not a statistically guaranteed OOD detection rate.
 
@@ -112,7 +135,16 @@ Bundle creation validates either legacy policy schema 4 or current schema 5; sch
 
 Validated bundles are copied into a content-addressed store under their `bundle_id`. Stored bundles are immutable. Deployment state is held in `deployment_state.json` with active/previous bundle IDs and a monotonically increasing generation number.
 
-Deployment-state bundle identifiers must be valid SHA-256 hex strings and must exactly match the selected bundle manifest. Promotion verifies both the new candidate and the currently active stored bundle before changing the state pointer, so a corrupted current deployment is not silently preserved as the claimed rollback target. Rollback verifies both bundles before swapping complete identifiers, so model, policy, quality guard, preprocessing metadata, and validation evidence move together.
+Promotion and rollback require a single writer. Serialise these operations;
+the state file does not implement locking or compare-and-swap for concurrent
+controllers.
+
+Deployment-state bundle identifiers must be valid SHA-256 hex strings and must exactly match the selected bundle manifest. Promotion also checks the identity of an existing cached candidate before changing the state pointer. It verifies both the new candidate and the currently active stored bundle before changing the state pointer.
+
+Rollback always verifies the previous deployment before activating it. When the
+current deployment is healthy, their complete identifiers are swapped. When the
+active bundle is damaged, rollback restores the verified previous deployment
+and clears `previous_bundle_id`; the damaged files remain available for diagnosis.
 
 ## Filesystem safety
 
@@ -120,9 +152,20 @@ Commands that replace directory trees validate their destinations before recursi
 
 The synthetic generator, robustness benchmark, downlink filter, and deployment-bundle builder use guarded destinations; the generated data/downlink workflows build complete outputs in sibling staging directories and only replace destinations after successful work. Existing output is preserved when generation or processing fails before the final swap.
 
+Checkpoint, export and quantisation files are verified in staging before their
+model/schema/report sets replace existing files. Source files and output aliases
+are checked before work begins. Downlink publication restores the previous tree
+and log if either replacement fails; failed copies leave no partial retained tile.
+These coordinated renames handle ordinary write failures and interruptions.
+They do not provide atomic multi-file visibility to concurrent readers or
+power-loss transactions; readers must wait for the command to complete.
+
 ## Watchdog
 
 The watchdog uses `subprocess.Popen` without `shell=True`. It supports bounded restart, optional wall-clock timeout, optional heartbeat-file timeout, graceful terminate-first behaviour, kill escalation, and structured per-attempt JSONL telemetry. This remains a process-level research pattern rather than spacecraft FDIR.
+
+Timeouts must be finite. An interrupted monitor terminates its own child, and a
+new attempt cannot start until termination of the previous child is confirmed.
 
 ## Pipeline ordering
 
